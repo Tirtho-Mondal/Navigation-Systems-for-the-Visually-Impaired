@@ -1,11 +1,10 @@
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 import math
 import heapq
 import os
 import time
-import tensorflow as tf   # TFLite runtime (comes with tf or install tflite-runtime)
+import tensorflow as tf
 
 # =========================
 #  FFT DENOISING FUNCTION
@@ -58,8 +57,7 @@ def robust_laplacian_edge_detector_fast(image, log_image, threshold_value):
         (np.roll(log_image, 1, axis=0) * np.roll(log_image, -1, axis=0) < 0) |
         (np.roll(log_image, 1, axis=1) * np.roll(log_image, -1, axis=1) < 0)
     )
-    edges = np.where((zero_cross) & (variance_image > threshold_value), 255, 0).astype(np.uint8)
-    return edges
+    return np.where((zero_cross) & (variance_image > threshold_value), 255, 0).astype(np.uint8)
 
 def custom_canny(image, low_thresh=50, high_thresh=150, sigma=1.0):
     image = image.astype(np.float32)
@@ -133,14 +131,12 @@ def slope_to_clock_if(m_img):
     else: return "9"
 
 # =========================
-#  LOAD TFLITE MIDAS MODEL
+#  LOAD & RUN MIDAS (TFLITE)
 # =========================
 def load_tflite_midas(model_path):
     interpreter = tf.lite.Interpreter(model_path=model_path)
     interpreter.allocate_tensors()
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
-    return interpreter, input_details, output_details
+    return interpreter, interpreter.get_input_details(), interpreter.get_output_details()
 
 def run_tflite_depth(interpreter, input_details, output_details, image_rgb):
     img_input = cv2.resize(image_rgb, (256, 256)) / 255.0
@@ -149,128 +145,143 @@ def run_tflite_depth(interpreter, input_details, output_details, image_rgb):
     interpreter.invoke()
     depth = interpreter.get_tensor(output_details[0]['index'])[0]
     depth_resized = cv2.resize(depth, (image_rgb.shape[1], image_rgb.shape[0]))
-    depth_norm = cv2.normalize(depth_resized, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    return depth_norm
+    return cv2.normalize(depth_resized, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
 # =========================
-#  MAIN PIPELINE
+#  MAIN PIPELINE (BATCH)
 # =========================
 ASSET_DIR = "assets"
 MODEL_PATH = "models/MiDaS-V2.tflite"
-img_path = os.path.join(ASSET_DIR, "1.jpg")
+RESULT_DIR = "results"
+os.makedirs(RESULT_DIR, exist_ok=True)
 
-if not os.path.exists(img_path):
-    raise FileNotFoundError(f"⚠️ '{img_path}' not found!")
-if not os.path.exists(MODEL_PATH):
-    raise FileNotFoundError(f"⚠️ '{MODEL_PATH}' not found!")
-
-timing = {}
-total_start = time.time()
-
-# Load MiDaS TFLite model
 print("Loading MiDaS-V2.tflite model...")
-midas_start = time.time()
+model_start = time.time()
 interpreter, input_details, output_details = load_tflite_midas(MODEL_PATH)
-timing["Model Load"] = time.time() - midas_start
+model_load_time = time.time() - model_start
+print(f"✅ Model loaded in {model_load_time:.3f}s\n")
 
-# Load image
-load_start = time.time()
-img = cv2.imread(img_path)
-img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-img_gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-timing["Image Load"] = time.time() - load_start
+summary = []
+overall_start = time.time()
 
-# Step 1: Histogram Equalization
-t1 = time.time()
-img_eq = apply_hist_eq_rgb(img_rgb)
-timing["Histogram Equalization"] = time.time() - t1
+for img_idx in range(1, 15):  # 1.jpg – 14.jpg
+    img_path = os.path.join(ASSET_DIR, f"{img_idx}.jpg")
+    if not os.path.exists(img_path):
+        print(f"⚠️ {img_path} not found — skipping.")
+        continue
 
-# Step 2: FFT Denoise
-t2 = time.time()
-smooth1_gray = fft_denoise(cv2.cvtColor(img_eq, cv2.COLOR_RGB2GRAY), keep_fraction=0.1)
-timing["FFT Denoise"] = time.time() - t2
+    print(f"\n🖼️ Processing {img_path} ...")
+    timing = {}
 
-# Step 3: Fast Edge Detection
-t3 = time.time()
-log_conv = cv2.Laplacian(cv2.GaussianBlur(smooth1_gray, (9, 9), 1.0), cv2.CV_32F)
-edges_log = robust_laplacian_edge_detector_fast(img_gray, log_conv, 150)
-edges_canny = custom_canny(edges_log, 50, 150)
-edges = cv2.bitwise_or(edges_canny, edges_log)
-timing["Edge Detection"] = time.time() - t3
+    total_start = time.time()
 
-# Step 4: Depth Estimation (TFLite)
-t4 = time.time()
-depth = run_tflite_depth(interpreter, input_details, output_details, cv2.cvtColor(smooth1_gray, cv2.COLOR_GRAY2RGB))
-timing["Depth Estimation"] = time.time() - t4
+    # Image load
+    t = time.time()
+    img = cv2.imread(img_path)
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img_gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    timing["Image Load"] = time.time() - t
 
-# Step 5: Combine Depth + Edges
-t5 = time.time()
-combined = np.where(edges > 0, 255.0, depth).astype(np.float32)
-combined = cv2.normalize(combined, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-timing["Combine Depth + Edges"] = time.time() - t5
+    # Histogram Equalization
+    t = time.time()
+    img_eq = apply_hist_eq_rgb(img_rgb)
+    timing["Histogram Equalization"] = time.time() - t
 
-# Step 6: Pathfinding + Direction
-t6 = time.time()
-PATCH_ROWS, PATCH_COLS = 15, 15
-h, w = combined.shape
-patch_h, patch_w = h // PATCH_ROWS, w // PATCH_COLS
-combo_patch = np.zeros((PATCH_ROWS, PATCH_COLS), dtype=np.float32)
-for r in range(PATCH_ROWS):
-    for c in range(PATCH_COLS):
-        patch = combined[r*patch_h:(r+1)*patch_h, c*patch_w:(c+1)*patch_w]
-        combo_patch[r, c] = np.mean(patch)
-combo_patch_f = combo_patch / 255.0
-start = (PATCH_ROWS - 1, PATCH_COLS // 2)
-goal_region = combo_patch[:5, :]
-goal = np.unravel_index(np.argmin(goal_region), goal_region.shape)
-path = astar_pathfinding(combo_patch_f, start, goal)
+    # FFT Denoise
+    t = time.time()
+    smooth1_gray = fft_denoise(cv2.cvtColor(img_eq, cv2.COLOR_RGB2GRAY), keep_fraction=0.1)
+    timing["FFT Denoise"] = time.time() - t
 
-if path:
-    x_vals = np.array([c - start[1] for r, c in path])
-    y_vals = np.array([r - start[0] for r, c in path])
-    m = np.sum(x_vals * y_vals) / (np.sum(x_vals**2) + 1e-6)
-    m_img = (h / PATCH_ROWS) / (w / PATCH_COLS) * m
-    c_img = (h - 1) - m_img * (w // 2)
-    direction = slope_to_clock_if(m_img)
-else:
-    direction = "No path found"
-timing["Pathfinding + Direction"] = time.time() - t6
+    # Edge Detection
+    t = time.time()
+    log_conv = cv2.Laplacian(cv2.GaussianBlur(smooth1_gray, (9, 9), 1.0), cv2.CV_32F)
+    edges_log = robust_laplacian_edge_detector_fast(img_gray, log_conv, 150)
+    edges_canny = custom_canny(edges_log, 50, 150)
+    edges = cv2.bitwise_or(edges_canny, edges_log)
+    timing["Edge Detection"] = time.time() - t
 
-without_viz_time = time.time() - total_start
+    # Depth Estimation
+    t = time.time()
+    depth = run_tflite_depth(interpreter, input_details, output_details,
+                             cv2.cvtColor(smooth1_gray, cv2.COLOR_GRAY2RGB))
+    timing["Depth Estimation"] = time.time() - t
 
-# Visualization
-viz_start = time.time()
-img_arrow = img_rgb.copy()
-if path:
-    arrow_len = int(h / 3)
-    y_end = max(h - 1 - arrow_len, 0)
-    x_end = int((y_end - c_img) / m_img)
-    cv2.arrowedLine(img_arrow, (w // 2, h - 1), (x_end, y_end), (255, 255, 0), 3, tipLength=0.2)
+    # Combine
+    t = time.time()
+    combined = np.where(edges > 0, 255.0, depth).astype(np.float32)
+    combined = cv2.normalize(combined, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    timing["Combine Depth + Edges"] = time.time() - t
 
-titles = ["Original", "Histogram Eq", "FFT Denoise", "Edges", "Depth Map", f"Path + Direction ({direction})"]
-images = [img_rgb, img_eq, smooth1_gray, edges, depth, img_arrow]
-plt.figure(figsize=(20, 12))
-for i, (im, title) in enumerate(zip(images, titles)):
-    plt.subplot(2, 3, i + 1)
-    plt.imshow(im, cmap='gray' if im.ndim == 2 else None)
-    plt.title(title)
-    plt.axis('off')
-plt.tight_layout()
-plt.show()
-timing["Visualization"] = time.time() - viz_start
-total_time = time.time() - total_start
+    # Pathfinding + Direction
+    t = time.time()
+    PATCH_ROWS, PATCH_COLS = 15, 15
+    h, w = combined.shape
+    patch_h, patch_w = h // PATCH_ROWS, w // PATCH_COLS
+    combo_patch = np.zeros((PATCH_ROWS, PATCH_COLS), dtype=np.float32)
+    for r in range(PATCH_ROWS):
+        for c in range(PATCH_COLS):
+            combo_patch[r, c] = np.mean(combined[r*patch_h:(r+1)*patch_h, c*patch_w:(c+1)*patch_w])
+    combo_patch_f = combo_patch / 255.0
+    start = (PATCH_ROWS - 1, PATCH_COLS // 2)
+    goal_region = combo_patch[:5, :]
+    goal = np.unravel_index(np.argmin(goal_region), goal_region.shape)
+    path = astar_pathfinding(combo_patch_f, start, goal)
+    if path:
+        x_vals = np.array([c - start[1] for r, c in path])
+        y_vals = np.array([r - start[0] for r, c in path])
+        m = np.sum(x_vals * y_vals) / (np.sum(x_vals**2) + 1e-6)
+        m_img = (h / PATCH_ROWS) / (w / PATCH_COLS) * m
+        c_img = (h - 1) - m_img * (w // 2)
+        direction = slope_to_clock_if(m_img)
+    else:
+        direction = "No path found"
+        m_img, c_img = 0, 0
+    timing["Pathfinding + Direction"] = time.time() - t
 
-# =========================
-#  PRINT RESULTS
-# =========================
-print("\n================= PROCESS SUMMARY =================")
-print(f"Direction Detected: {direction}")
-print("----------------------------------------------------")
-print(f"{'Step':35s} | {'Time (sec)':>10s}")
-print("-" * 50)
-for step, t in timing.items():
-    print(f"{step:35s} | {t:10.3f}")
-print("-" * 50)
-print(f"{'Total (without visualization)':35s} | {without_viz_time:10.3f}")
-print(f"{'Total (with visualization)':35s} | {total_time:10.3f}")
-print("====================================================\n")
+    # Visualization (save)
+    t = time.time()
+    img_arrow = img_rgb.copy()
+    if path:
+        arrow_len = int(h / 3)
+        y_end = max(h - 1 - arrow_len, 0)
+        if abs(m_img) < 1e-6 or np.isinf(m_img):
+            x_end = w // 2
+        else:
+            x_end = int((y_end - c_img) / m_img)
+            x_end = np.clip(x_end, 0, w - 1)
+        cv2.arrowedLine(img_arrow, (w // 2, h - 1), (x_end, y_end),
+                        (255, 255, 0), 3, tipLength=0.2)
+    out_path = os.path.join("results", f"{img_idx:02d}_result.jpg")
+    cv2.imwrite(out_path, cv2.cvtColor(img_arrow, cv2.COLOR_RGB2BGR))
+    timing["Visualization"] = time.time() - t
+
+    total_time = time.time() - total_start
+
+    # ------------------------------
+    # Print detailed per-step table
+    # ------------------------------
+    print(f"\nStep                                | Time (sec)")
+    print("-" * 50)
+    for k, v in timing.items():
+        print(f"{k:35s} | {v:10.3f}")
+    print("-" * 50)
+    print(f"{'Total (without visualization)':35s} | {total_time - timing['Visualization']:10.3f}")
+    print(f"{'Total (with visualization)':35s} | {total_time:10.3f}")
+    print("=" * 50)
+    print(f"✅ Direction: {direction}\n")
+
+    summary.append({
+        "Image": f"{img_idx}.jpg",
+        "Direction": direction,
+        "Total": total_time
+    })
+
+overall_time = time.time() - overall_start
+print("\n================ SUMMARY (All Images) ================")
+print(f"{'Image':10s} | {'Direction':12s} | {'Total Time (s)':>15s}")
+print("-" * 45)
+for s in summary:
+    print(f"{s['Image']:10s} | {s['Direction']:12s} | {s['Total']:15.3f}")
+print("-" * 45)
+print(f"Batch total time: {overall_time:.3f}s (avg {overall_time/len(summary):.3f}s/image)")
+print("=======================================================")
