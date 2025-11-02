@@ -35,20 +35,16 @@ def measure(timings: dict, key: str):
 # Core Ops
 # -----------------------------
 def fft_denoise(image: np.ndarray, keep_fraction: float = 0.1) -> np.ndarray:
-    image_float = image.astype(np.float32) / 255.0
-    f = np.fft.fft2(image_float)
-    fshift = np.fft.fftshift(f)
-    rows, cols = image.shape
-    crow, ccol = rows // 2, cols // 2
-    mask = np.zeros((rows, cols), np.float32)
-    keep_r = max(1, int(rows * keep_fraction / 2))
-    keep_c = max(1, int(cols * keep_fraction / 2))
-    mask[crow - keep_r:crow + keep_r, ccol - keep_c:ccol + keep_c] = 1.0
-    fshift_filtered = fshift * mask
-    f_ishift = np.fft.ifftshift(fshift_filtered)
-    img_back = np.fft.ifft2(f_ishift)
-    img_denoised = np.abs(img_back)
-    return np.clip(img_denoised * 255.0, 0, 255).astype(np.uint8)
+    """
+    FAST replacement for the original FFT-based low-pass:
+    Use OpenCV Gaussian blur (vectorized, C++).
+    We map smaller keep_fraction -> stronger blur (larger sigma).
+    """
+    # clamp and map keep_fraction in [0.01, 0.99] to sigma in ~[0.6, 4.0]
+    kf = float(np.clip(keep_fraction, 0.01, 0.99))
+    sigma = 0.6 + (1.0 - kf) * 3.4  # keep_fraction=0.1 -> ~3.66 (strong smooth)
+    # (0,0) lets OpenCV compute kernel size from sigma; preserves uint8 dtype
+    return cv2.GaussianBlur(image, (0, 0), sigmaX=sigma, sigmaY=sigma, borderType=cv2.BORDER_REPLICATE)
 
 
 def apply_clahe_rgb_lab(image_rgb: np.ndarray, clip_limit: float = 2.0, tile_grid_size=(8, 8)) -> np.ndarray:
@@ -85,14 +81,26 @@ def local_variance_cv(image: np.ndarray, ksize: int = 3) -> np.ndarray:
 
 
 def robust_laplacian_edge_detector(image_gray: np.ndarray, log_image: np.ndarray, threshold_value: float) -> np.ndarray:
-    M, N = image_gray.shape
-    edges = np.zeros_like(image_gray, dtype=np.float32)
+    """
+    FAST vectorized zero-crossing + variance gating (no Python loops).
+    Keeps your API and behavior, but runs orders of magnitude faster.
+    """
+    # local variance (already fast via OpenCV box filters)
     variance_image = local_variance_cv(image_gray, 3)
-    for i in range(1, M - 1):
-        for j in range(1, N - 1):
-            if (log_image[i + 1, j] * log_image[i - 1, j] < 0) or (log_image[i, j + 1] * log_image[i, j - 1] < 0):
-                edges[i, j] = 255.0 if variance_image[i, j] > threshold_value else 0.0
-    return edges.astype(np.uint8)
+
+    # compute zero-crossings along vertical and horizontal directions
+    # shapes: center window is [1:-1,1:-1]
+    zc_vert = (log_image[2:, 1:-1] * log_image[:-2, 1:-1]) < 0
+    zc_horz = (log_image[1:-1, 2:] * log_image[1:-1, :-2]) < 0
+    zc = np.logical_or(zc_vert, zc_horz)
+
+    # variance gate at center pixels
+    var_gate = variance_image[1:-1, 1:-1] > threshold_value
+
+    # compose edges
+    edges = np.zeros_like(image_gray, dtype=np.uint8)
+    edges[1:-1, 1:-1] = (zc & var_gate).astype(np.uint8) * 255
+    return edges
 
 
 # -----------------------------
