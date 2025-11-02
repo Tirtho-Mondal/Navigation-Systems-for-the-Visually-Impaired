@@ -1,4 +1,4 @@
-import os
+import argparse
 import math
 import heapq
 from pathlib import Path
@@ -6,7 +6,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
-import torch
+
+# -----------------------------
+# TFLite interpreter (tflite-runtime preferred; falls back to TF)
+# -----------------------------
+try:
+    from tflite_runtime.interpreter import Interpreter
+except Exception:
+    from tensorflow.lite.python.interpreter import Interpreter  # type: ignore
 
 
 # -----------------------------
@@ -33,19 +40,13 @@ def fft_denoise(image: np.ndarray, keep_fraction: float = 0.1) -> np.ndarray:
 
 
 def apply_hist_eq_rgb_v_channel(image_rgb: np.ndarray) -> np.ndarray:
-    """
-    Histogram equalization on V channel in HSV space to preserve color balance.
-    image_rgb expected in RGB order.
-    """
+    """Histogram equalization on V channel in HSV space (keeps colors natural)."""
     hsv = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2HSV)
     h, s, v = cv2.split(hsv)
-
-    # Build LUT via CDF
     hist = cv2.calcHist([v], [0], None, [256], [0, 256])
     cdf = hist.cumsum()
     cdf_normalized = (cdf / cdf[-1]).flatten()
     lut = np.uint8(255 * cdf_normalized)
-
     v_eq = cv2.LUT(v, lut)
     hsv_eq = cv2.merge([h, s, v_eq])
     return cv2.cvtColor(hsv_eq, cv2.COLOR_HSV2RGB)
@@ -60,7 +61,6 @@ def LoG(x: float, y: float, sigma: float) -> float:
 
 
 def LoG_Kernel_Generator(size: int, sigma: float) -> np.ndarray:
-    """Generates a standard (not rotated) LoG kernel centered at (k, k)."""
     k = size // 2
     kernel = np.zeros((size, size), dtype=np.float32)
     for dy in range(-k, k + 1):
@@ -75,7 +75,6 @@ def local_variance_cv(image: np.ndarray, ksize: int = 3) -> np.ndarray:
     mean_sq = cv2.blur(image**2, (ksize, ksize))
     variance = mean_sq - mean**2
     pad = ksize // 2
-    # explicit zero borders (avoid weak edges on borders)
     variance[:pad, :] = 0
     variance[-pad:, :] = 0
     variance[:, :pad] = 0
@@ -84,21 +83,13 @@ def local_variance_cv(image: np.ndarray, ksize: int = 3) -> np.ndarray:
 
 
 def robust_laplacian_edge_detector(image_gray: np.ndarray, log_image: np.ndarray, threshold_value: float) -> np.ndarray:
-    """
-    Zero-crossing edge detector with local variance gating.
-    image_gray, log_image: float32/uint8, same HxW. Returns uint8 {0,255}.
-    """
     M, N = image_gray.shape
     edges = np.zeros_like(image_gray, dtype=np.float32)
     variance_image = local_variance_cv(image_gray, 3)
-
-    # NOTE: loop is fine for clarity; image sizes are typical photos.
     for i in range(1, M - 1):
         for j in range(1, N - 1):
-            # zero-crossing check (horizontal or vertical neighbors)
             if (log_image[i + 1, j] * log_image[i - 1, j] < 0) or (log_image[i, j + 1] * log_image[i, j - 1] < 0):
                 edges[i, j] = 255.0 if variance_image[i, j] > threshold_value else 0.0
-
     return edges.astype(np.uint8)
 
 
@@ -134,7 +125,6 @@ def astar_pathfinding(cost_map: np.ndarray, start, goal):
                 current = came_from[current]
                 path.append(current)
             return path[::-1]
-
         for neighbor in get_neighbors(current, rows, cols):
             tentative_g = g_score[current] + float(cost_map[neighbor])
             if tentative_g < g_score.get(neighbor, float("inf")):
@@ -146,12 +136,10 @@ def astar_pathfinding(cost_map: np.ndarray, start, goal):
 
 
 def slope_to_clock_if(m_img: float) -> str:
-    # convert slope to a "clock" direction label
     m_math = -m_img
     vx, vy = (1.0, m_math) if m_math >= 0 else (-1.0, -m_math)
     angle = np.degrees(np.arctan2(vy, vx))
     angle = float(np.clip(angle, 0, 180))
-
     if angle < 7.5:
         return "3"
     elif angle < 22.5:
@@ -181,54 +169,151 @@ def slope_to_clock_if(m_img: float) -> str:
 
 
 # -----------------------------
-# MiDaS Depth (Torch Hub)
+# MiDaS (TFLite) loader + inference
 # -----------------------------
-def load_midas(device: torch.device):
-    # MiDaS small is fast and good enough
-    midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small", trust_repo=True)
-    midas.eval().to(device)
+class MidasTFLite:
+    """
+    Loads ./models/Midas-V2.tflite and infers depth on RGB (H,W,3).
+    Handles float32 or uint8 inputs and resizes output back to the input image size.
+    """
 
-    midas_trans = torch.hub.load("intel-isl/MiDaS", "transforms")
-    if hasattr(midas_trans, "small_transform"):
-        transform = midas_trans.small_transform
-    elif hasattr(midas_trans, "default_transform"):
-        transform = midas_trans.default_transform
-    elif hasattr(midas_trans, "dpt_transform"):
-        transform = midas_trans.dpt_transform
+    def __init__(self, model_path: str):
+        model_p = Path(model_path)
+        if not model_p.exists():
+            raise FileNotFoundError(f"TFLite model not found at: {model_p}")
+        self.interpreter = Interpreter(model_path=str(model_p))
+        self.interpreter.allocate_tensors()
+        self.input_details = self.interpreter.get_input_details()
+        self.output_details = self.interpreter.get_output_details()
+        self.inp = self.input_details[0]
+        self.out = self.output_details[0]
+        _, self.in_h, self.in_w, self.in_c = self.inp["shape"]
+        self.in_dtype = self.inp["dtype"]
+
+    def preprocess(self, rgb: np.ndarray) -> np.ndarray:
+        resized = cv2.resize(rgb, (self.in_w, self.in_h), interpolation=cv2.INTER_AREA)
+        if self.in_dtype == np.uint8:
+            return resized[np.newaxis, ...].astype(np.uint8)
+        return (resized.astype(np.float32) / 255.0)[np.newaxis, ...]
+
+    def postprocess(self, out_arr: np.ndarray, out_size_hw) -> np.ndarray:
+        x = out_arr
+        if x.ndim == 4:
+            if x.shape[-1] == 1:
+                x = x[0, :, :, 0]
+            elif x.shape[1] == 1:
+                x = x[0, 0, :, :]
+            else:
+                x = x[0]
+        elif x.ndim == 3:
+            x = x[0]
+        x = x.astype(np.float32)
+        mn, mx = float(x.min()), float(x.max())
+        if mx - mn < 1e-9:
+            x = np.zeros_like(x, dtype=np.uint8)
+        else:
+            x = (255.0 * (x - mn) / (mx - mn)).astype(np.uint8)
+        H, W = out_size_hw
+        return cv2.resize(x, (W, H), interpolation=cv2.INTER_CUBIC)
+
+    def __call__(self, rgb: np.ndarray) -> np.ndarray:
+        inp = self.preprocess(rgb)
+        self.interpreter.set_tensor(self.inp["index"], inp)
+        self.interpreter.invoke()
+        out_arr = self.interpreter.get_tensor(self.out["index"])
+        return self.postprocess(out_arr, (rgb.shape[0], rgb.shape[1]))
+
+
+# -----------------------------
+# Single-image pipeline
+# -----------------------------
+def run_on_image(image_path: Path, model_path: Path, output_dir: Path):
+    if not image_path.exists():
+        raise FileNotFoundError(f"Image not found: {image_path}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # load model
+    depth_net = MidasTFLite(str(model_path))
+
+    # read + convert
+    img_bgr = cv2.imread(str(image_path))
+    if img_bgr is None:
+        raise ValueError(f"Failed to read image: {image_path}")
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    img_gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+
+    # 1) Histogram Equalization (V channel)
+    img_eq = apply_hist_eq_rgb_v_channel(img_rgb)
+
+    # 2) FFT Denoise #1
+    smooth1_gray = fft_denoise(cv2.cvtColor(img_eq, cv2.COLOR_RGB2GRAY), keep_fraction=0.1)
+    smooth1_rgb = cv2.cvtColor(smooth1_gray, cv2.COLOR_GRAY2RGB)
+
+    # 3) Edge Detection (LoG)
+    sigma = 1.0
+    kernel_size = int(max(3, (9 * sigma))) | 1
+    log_kernel = LoG_Kernel_Generator(kernel_size, sigma)
+    log_conv = cv2.filter2D(smooth1_gray.astype(np.float32), ddepth=-1, kernel=log_kernel)
+    edges = robust_laplacian_edge_detector(img_gray, log_conv, threshold_value=150.0)
+
+    # 4) (Optional) FFT Denoise #2 on equalized gray (kept for parity)
+    smooth2_gray = fft_denoise(cv2.cvtColor(img_eq, cv2.COLOR_RGB2GRAY), keep_fraction=0.1)
+    smooth2_rgb = cv2.cvtColor(smooth2_gray, cv2.COLOR_GRAY2RGB)
+
+    # 5) Depth Map via TFLite MiDaS
+    depth = depth_net(smooth2_rgb)
+
+    # 6) Combine Depth + Edge
+    combined = np.where(edges > 0, 255, depth).astype(np.uint8)
+
+    # 7) Patchify (15x15) & A*
+    PATCH_ROWS, PATCH_COLS = 15, 15
+    h, w = combined.shape
+    patch_h = max(1, h // PATCH_ROWS)
+    patch_w = max(1, w // PATCH_COLS)
+
+    combo_patch = np.zeros((PATCH_ROWS, PATCH_COLS), dtype=np.float32)
+    for r in range(PATCH_ROWS):
+        for c in range(PATCH_COLS):
+            y1, y2 = r * patch_h, min((r + 1) * patch_h, h)
+            x1, x2 = c * patch_w, min((c + 1) * patch_w, w)
+            patch = combined[y1:y2, x1:x2]
+            combo_patch[r, c] = float(np.mean(patch)) if patch.size else 0.0
+
+    combo_patch_f = combo_patch / 255.0
+
+    start = (PATCH_ROWS - 1, PATCH_COLS // 2)
+    goal_region = combo_patch_f[:5, :]
+    goal = np.unravel_index(np.argmin(goal_region), goal_region.shape)
+
+    path = astar_pathfinding(combo_patch_f, start, goal)
+    if not path:
+        print("No path found; drawing default line to top band.")
+        path = [start, goal]
+
+    # 8) Slope & direction
+    x_vals = np.array([c - start[1] for r, c in path], dtype=np.float32)
+    y_vals = np.array([r - start[0] for r, c in path], dtype=np.float32)
+    denom = float(np.sum(x_vals**2) + 1e-6)
+    m = float(np.sum(x_vals * y_vals) / denom)
+
+    m_img = (h / PATCH_ROWS) / (w / PATCH_COLS) * m
+    c_img = (h - 1) - m_img * (w // 2)
+    direction = slope_to_clock_if(m_img)
+
+    # 9) Draw Arrow (safe for near-horizontal slopes)
+    img_arrow = img_rgb.copy()
+    arrow_len = int(max(10, h / 3))
+    y_end = max(h - 1 - arrow_len, 0)
+    if abs(m_img) < 1e-6:
+        x_end = w // 2
     else:
-        raise RuntimeError("No compatible MiDaS transform found.")
-    return midas, transform
+        x_end = int((y_end - c_img) / m_img)
+    x_end = int(np.clip(x_end, 0, w - 1))
+    cv2.arrowedLine(img_arrow, (w // 2, h - 1), (x_end, y_end), (255, 255, 0), 3, tipLength=0.2)
 
-
-# -----------------------------
-# Main
-# -----------------------------
-def main():
-    # Paths
-    ROOT = Path(__file__).resolve().parent
-    ASSETS = ROOT / "assets"
-    OUTDIR = ROOT / "outputs"
-    OUTDIR.mkdir(exist_ok=True)
-
-    # Collect the images named as 1.jpg..13.jpg (or whatever exists among them)
-    indices = list(range(1, 14))
-    img_paths = [ASSETS / f"{i}.jpg" for i in indices if (ASSETS / f"{i}.jpg").exists()]
-    if not img_paths:
-        raise FileNotFoundError(f"No images found at {ASSETS}. Expected files like 1.jpg, 2.jpg, ...")
-
-    # Torch device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    midas, transform = load_midas(device)
-
-    # Prepare figure depending on how many images were found
-    n_rows = len(img_paths)
-    n_cols = 8
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(42, 4.5 * n_rows))
-    # Ensure axes is 2D for unified indexing
-    if n_rows == 1:
-        axes = np.expand_dims(axes, axis=0)
-    plt.subplots_adjust(hspace=0.4, wspace=0.3)
-
+    # 10) Plot single row (8 columns)
+    images = [img_rgb, img_eq, smooth1_rgb, edges, depth, combined, combo_patch, img_arrow]
     titles = [
         "Original",
         "Histogram Eq",
@@ -237,140 +322,45 @@ def main():
         "Depth Map",
         "Depth + Edge",
         "15x15 Patch + Path",
-        "Arrow (Clock dir)"
+        f"Clock: {direction} (m={m_img:.3f})",
     ]
 
-    for row_idx, img_path in enumerate(img_paths):
-        img_bgr = cv2.imread(str(img_path))
-        if img_bgr is None:
-            print(f"{img_path} not found or unreadable. Skipping...")
-            continue
-
-        # BGR -> RGB for consistency
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        img_gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-
-        # 1) Histogram Equalization (V channel)
-        img_eq = apply_hist_eq_rgb_v_channel(img_rgb)
-
-        # 2) FFT Denoise #1 on gray from equalized image
-        smooth1_gray = fft_denoise(cv2.cvtColor(img_eq, cv2.COLOR_RGB2GRAY), keep_fraction=0.1)
-        smooth1_rgb = cv2.cvtColor(smooth1_gray, cv2.COLOR_GRAY2RGB)
-
-        # 3) Edge Detection (LoG)
-        sigma = 1.0
-        kernel_size = int(max(3, (9 * sigma))) | 1  # ensure odd, >=3
-        log_kernel = LoG_Kernel_Generator(kernel_size, sigma)
-        log_conv = cv2.filter2D(smooth1_gray.astype(np.float32), ddepth=-1, kernel=log_kernel)
-        edges = robust_laplacian_edge_detector(img_gray, log_conv, threshold_value=150.0)
-
-        # 4) FFT Denoise #2 (repeat denoise on equalized gray)
-        smooth2_gray = fft_denoise(cv2.cvtColor(img_eq, cv2.COLOR_RGB2GRAY), keep_fraction=0.1)
-        smooth2_rgb = cv2.cvtColor(smooth2_gray, cv2.COLOR_GRAY2RGB)  # keep input RGB-like for transform
-
-        # 5) Depth Map (MiDaS)
-        with torch.no_grad():
-            input_batch = transform(smooth2_rgb).to(device)
-            pred = midas(input_batch)
-            pred = torch.nn.functional.interpolate(
-                pred.unsqueeze(1),
-                size=img_rgb.shape[:2],
-                mode="bicubic",
-                align_corners=False,
-            ).squeeze(1).squeeze(0)
-        depth = cv2.normalize(pred.detach().cpu().numpy(), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-        # 6) Combine Depth + Edge (edges brighter)
-        edges_binary = (edges > 0).astype(np.uint8)
-        combined = np.where(edges_binary == 1, 255, depth).astype(np.uint8)
-
-        # 7) Patchify (15x15) & A*
-        PATCH_ROWS, PATCH_COLS = 15, 15
-        h, w = combined.shape
-        patch_h = h // PATCH_ROWS
-        patch_w = w // PATCH_COLS
-        # guard for tiny images
-        patch_h = max(1, patch_h)
-        patch_w = max(1, patch_w)
-
-        combo_patch = np.zeros((PATCH_ROWS, PATCH_COLS), dtype=np.float32)
-        for r in range(PATCH_ROWS):
-            for c in range(PATCH_COLS):
-                y1, y2 = r * patch_h, min((r + 1) * patch_h, h)
-                x1, x2 = c * patch_w, min((c + 1) * patch_w, w)
-                patch = combined[y1:y2, x1:x2]
-                combo_patch[r, c] = float(np.mean(patch)) if patch.size else 0.0
-
-        combo_patch_f = combo_patch / 255.0
-
-        start = (PATCH_ROWS - 1, PATCH_COLS // 2)
-        goal_region = combo_patch_f[:5, :]
-        goal = np.unravel_index(np.argmin(goal_region), goal_region.shape)  # closest (smallest cost) in top band
-
-        path = astar_pathfinding(combo_patch_f, start, goal)
-        if not path:
-            print(f"No path found for {img_path.name}")
-            # still continue to plot everything else
-            path = [start, goal]
-
-        # 8) Slope & direction
-        x_vals = np.array([c - start[1] for r, c in path], dtype=np.float32)
-        y_vals = np.array([r - start[0] for r, c in path], dtype=np.float32)
-        denom = float(np.sum(x_vals**2) + 1e-6)
-        m = float(np.sum(x_vals * y_vals) / denom)
-
-        m_img = (h / PATCH_ROWS) / (w / PATCH_COLS) * m  # scale to image aspect
-        c_img = (h - 1) - m_img * (w // 2)
-        direction = slope_to_clock_if(m_img)
-
-        # 9) Draw Arrow (with safety for near-horizontal slope)
-        img_arrow = img_rgb.copy()
-        arrow_len = int(max(10, h / 3))
-        y_end = max(h - 1 - arrow_len, 0)
-
-        if abs(m_img) < 1e-6:
-            x_end = w // 2
+    fig, axes = plt.subplots(1, 8, figsize=(42, 5))
+    for col_idx, (im, title) in enumerate(zip(images, titles)):
+        ax = axes[col_idx]
+        if isinstance(im, np.ndarray) and im.ndim == 2:
+            ax.imshow(im, cmap="gray")
         else:
-            x_end = int((y_end - c_img) / m_img)
-
-        x_end = int(np.clip(x_end, 0, w - 1))
-        cv2.arrowedLine(img_arrow, (w // 2, h - 1), (x_end, y_end), (255, 255, 0), 3, tipLength=0.2)
-
-        # 10) Plot row
-        images = [
-            img_rgb,
-            img_eq,
-            smooth1_rgb,
-            edges,
-            depth,
-            combined,
-            combo_patch,
-            img_arrow,
-        ]
-
-        for col_idx, (im, title) in enumerate(zip(images, titles)):
-            ax = axes[row_idx, col_idx]
-            if im.ndim == 2:
-                ax.imshow(im, cmap="gray")
-            else:
-                ax.imshow(im)
-            ax.set_title(title)
-            ax.axis("off")
-
-        # add clock direction into the last subplot title
-        axes[row_idx, -1].set_title(f"Clock: {direction} (m={m_img:.3f})")
+            ax.imshow(im)
+        ax.set_title(title)
+        ax.axis("off")
 
     fig.suptitle(
-        "Full Pipeline: Histogram → FFT Denoise → Edge → FFT Denoise → Depth → Combine → Patch → A* → Clock",
-        fontsize=20,
+        "Pipeline (Single Image): Histogram → FFT Denoise → Edge → FFT Denoise → Depth (TFLite) → Combine → Patch → A* → Clock",
+        fontsize=16,
     )
-    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    plt.tight_layout(rect=[0, 0, 1, 0.92])
 
-    out_path = (OUTDIR / "pipeline.png").as_posix()
-    plt.savefig(out_path, dpi=150)
-    print(f"Saved: {out_path}")
+    stem = image_path.stem
+    out_dir = output_dir
+    out_dir.mkdir(exist_ok=True)
+    (out_dir / f"{stem}_arrow.png").write_bytes(cv2.imencode(".png", cv2.cvtColor(img_arrow, cv2.COLOR_RGB2BGR))[1])
+    fig_path = out_dir / f"{stem}_pipeline.png"
+    plt.savefig(fig_path.as_posix(), dpi=150)
+    print(f"Saved: {fig_path}")
     plt.show()
+
+    print(f"Direction: {direction}  |  slope (image space): {m_img:.4f}")
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Run pipeline on a single image using Midas-V2.tflite")
+    p.add_argument("--image", type=str, default="assets/1.jpg", help="Path to input image")
+    p.add_argument("--model", type=str, default="models/Midas-V2.tflite", help="Path to TFLite model")
+    p.add_argument("--outdir", type=str, default="outputs", help="Directory to save results")
+    return p.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    run_on_image(Path(args.image), Path(args.model), Path(args.outdir))
