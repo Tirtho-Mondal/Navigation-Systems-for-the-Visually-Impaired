@@ -1,3 +1,6 @@
+# ------------------------------------
+# Imports
+# ------------------------------------
 import os
 import math
 import heapq
@@ -7,7 +10,7 @@ from io import BytesIO
 from contextlib import contextmanager
 from pathlib import Path
 
-from flask import Flask, render_template, request, jsonify, abort, redirect, url_for
+from flask import Flask, render_template, request, jsonify, abort
 import cv2
 import numpy as np
 
@@ -17,14 +20,23 @@ except Exception:
     from tensorflow.lite.python.interpreter import Interpreter  # type: ignore
 
 
-# -----------------------------
+# ------------------------------------
+# Config
+# ------------------------------------
+DEFAULT_CLAHE_CLIP = 2.0
+DEFAULT_TILE_W = 8
+DEFAULT_TILE_H = 8
+MODEL_PATH = os.environ.get("MIDAS_TFLITE", "models/Midas-V2.tflite")
+
+
+# ------------------------------------
 # Timing helpers
-# -----------------------------
-def ms(seconds: float) -> float:
+# ------------------------------------
+def ms(seconds):
     return seconds * 1000.0
 
 @contextmanager
-def measure(timings: dict, key: str):
+def measure(timings, key):
     t0 = time.perf_counter()
     try:
         yield
@@ -32,15 +44,18 @@ def measure(timings: dict, key: str):
         timings[key] = time.perf_counter() - t0
 
 
-# -----------------------------
-# Core Ops (fast impls; keep names)
-# -----------------------------
-def fft_denoise(image: np.ndarray, keep_fraction: float = 0.1) -> np.ndarray:
-    kf = float(np.clip(keep_fraction, 0.01, 0.99))
-    sigma = 0.6 + (1.0 - kf) * 3.4
-    return cv2.GaussianBlur(image, (0, 0), sigmaX=sigma, sigmaY=sigma, borderType=cv2.BORDER_REPLICATE)
+# ------------------------------------
+# Core Image Ops
+# ------------------------------------
+# UNUSED: fft_denoise is not part of the new pipeline (image -> CLAHE -> gray -> Canny -> depth -> depth+edge -> A*).
+# def fft_denoise(image, keep_fraction=0.1):
+#     kf = float(np.clip(keep_fraction, 0.01, 0.99))
+#     sigma = 0.6 + (1.0 - kf) * 3.4
+#     return cv2.GaussianBlur(
+#         image, (0, 0), sigmaX=sigma, sigmaY=sigma, borderType=cv2.BORDER_REPLICATE
+#     )
 
-def apply_clahe_rgb_lab(image_rgb: np.ndarray, clip_limit: float = 2.0, tile_grid_size=(8, 8)) -> np.ndarray:
+def apply_clahe_rgb_lab(image_rgb, clip_limit=2.0, tile_grid_size=(8, 8)):
     lab = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=float(clip_limit), tileGridSize=tuple(tile_grid_size))
@@ -48,41 +63,124 @@ def apply_clahe_rgb_lab(image_rgb: np.ndarray, clip_limit: float = 2.0, tile_gri
     lab_eq = cv2.merge([l_eq, a, b])
     return cv2.cvtColor(lab_eq, cv2.COLOR_LAB2RGB)
 
-def LoG(x: float, y: float, sigma: float) -> float:
-    r2 = x**2 + y**2
-    return -1.0 / (math.pi * sigma**4) * (1.0 - r2 / (2.0 * sigma**2)) * math.exp(-r2 / (2.0 * sigma**2))
 
-def LoG_Kernel_Generator(size: int, sigma: float) -> np.ndarray:
-    k = size // 2
-    kernel = np.zeros((size, size), dtype=np.float32)
-    for dy in range(-k, k + 1):
-        for dx in range(-k, k + 1):
-            kernel[dy + k, dx + k] = LoG(dx, dy, sigma)
-    return kernel
+# ------------------------------------
+# LoG + Variance Gating (UNUSED in new pipeline)
+# ------------------------------------
+# def LoG(x, y, sigma):
+#     r2 = x**2 + y**2
+#     return -1.0 / (math.pi * sigma**4) * (1.0 - r2 / (2.0 * sigma**2)) * math.exp(-r2 / (2.0 * sigma**2))
+#
+# def LoG_Kernel_Generator(size, sigma):
+#     k = size // 2
+#     kernel = np.zeros((size, size), dtype=np.float32)
+#     for dy in range(-k, k + 1):
+#         for dx in range(-k, k + 1):
+#             kernel[dy + k, dx + k] = LoG(dx, dy, sigma)
+#     return kernel
+#
+# def local_variance_cv(image, ksize=3):
+#     image = image.astype(np.float32)
+#     mean = cv2.blur(image, (ksize, ksize))
+#     mean_sq = cv2.blur(image**2, (ksize, ksize))
+#     variance = mean_sq - mean**2
+#     pad = ksize // 2
+#     variance[:pad, :] = variance[-pad:, :] = variance[:, :pad] = variance[:, -pad:] = 0
+#     return variance
+#
+# def robust_laplacian_edge_detector(image_gray, log_image, threshold_value):
+#     variance_image = local_variance_cv(image_gray, 3)
+#     zc_vert = (log_image[2:, 1:-1] * log_image[:-2, 1:-1]) < 0
+#     zc_horz = (log_image[1:-1, 2:] * log_image[1:-1, :-2]) < 0
+#     zc = np.logical_or(zc_vert, zc_horz)
+#     var_gate = variance_image[1:-1, 1:-1] > threshold_value
+#     edges = np.zeros_like(image_gray, dtype=np.uint8)
+#     edges[1:-1, 1:-1] = (zc & var_gate).astype(np.uint8) * 255
+#     return edges
 
-def local_variance_cv(image: np.ndarray, ksize: int = 3) -> np.ndarray:
-    image = image.astype(np.float32)
-    mean = cv2.blur(image, (ksize, ksize))
-    mean_sq = cv2.blur(image**2, (ksize, ksize))
-    variance = mean_sq - mean**2
-    pad = ksize // 2
-    variance[:pad, :] = variance[-pad:, :] = variance[:, :pad] = variance[:, -pad:] = 0
-    return variance
-
-def robust_laplacian_edge_detector(image_gray: np.ndarray, log_image: np.ndarray, threshold_value: float) -> np.ndarray:
-    variance_image = local_variance_cv(image_gray, 3)
-    zc_vert = (log_image[2:, 1:-1] * log_image[:-2, 1:-1]) < 0
-    zc_horz = (log_image[1:-1, 2:] * log_image[1:-1, :-2]) < 0
-    zc = np.logical_or(zc_vert, zc_horz)
-    var_gate = variance_image[1:-1, 1:-1] > threshold_value
-    edges = np.zeros_like(image_gray, dtype=np.uint8)
-    edges[1:-1, 1:-1] = (zc & var_gate).astype(np.uint8) * 255
-    return edges
 
 
-# -----------------------------
-# A* Pathfinding (unchanged)
-# -----------------------------
+
+
+
+
+
+# def non_maximum_suppression(magnitude, angle):
+#     M, N = magnitude.shape
+#     nms = np.zeros((M, N), dtype=np.float32)
+#     angle = angle % 180  # ensure angle within [0, 180)
+
+#     for i in range(1, M - 1):
+#         for j in range(1, N - 1):
+#             q = r = 255
+#             a = angle[i, j]
+
+#             # Quantize direction and compare neighbors
+#             if (0 <= a < 22.5) or (157.5 <= a <= 180):
+#                 q, r = magnitude[i, j + 1], magnitude[i, j - 1]
+#             elif (22.5 <= a < 67.5):
+#                 q, r = magnitude[i - 1, j + 1], magnitude[i + 1, j - 1]
+#             elif (67.5 <= a < 112.5):
+#                 q, r = magnitude[i - 1, j], magnitude[i + 1, j]
+#             elif (112.5 <= a < 157.5):
+#                 q, r = magnitude[i + 1, j + 1], magnitude[i - 1, j - 1]
+
+#             if (magnitude[i, j] >= q) and (magnitude[i, j] >= r):
+#                 nms[i, j] = magnitude[i, j]
+
+#     return nms
+
+
+# def custom_canny(image, low_thresh=50, high_thresh=150, sigma=1.0):
+#     image = image.astype(np.float32)
+#     blurred = cv2.GaussianBlur(image, (5, 5), sigma)
+
+#     # Gradient computation
+#     Kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
+#     Ky = np.array([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=np.float32)
+#     Gx = cv2.filter2D(blurred, -1, Kx)
+#     Gy = cv2.filter2D(blurred, -1, Ky)
+
+#     magnitude = np.hypot(Gx, Gy)
+#     magnitude = magnitude / magnitude.max() * 255
+#     angle = np.rad2deg(np.arctan2(Gy, Gx))
+
+#     # Apply Non-Maximum Suppression
+#     nms = non_maximum_suppression(magnitude, angle)
+
+#     # Double threshold
+#     strong, weak = 255, 75
+#     M, N = nms.shape
+#     result = np.zeros((M, N), dtype=np.uint8)
+
+#     for i in range(M):
+#         for j in range(N):
+#             pixel = nms[i, j]
+#             if pixel >= high_thresh:
+#                 result[i, j] = strong
+#             elif pixel >= low_thresh:
+#                 result[i, j] = weak
+#             else:
+#                 result[i, j] = 0
+
+
+#     # Hysteresis
+#     M, N = result.shape
+#     for i in range(1, M - 1):
+#         for j in range(1, N - 1):
+#             if result[i, j] == weak:
+#                 if np.any(result[i-1:i+2, j-1:j+2] == strong):
+#                     result[i, j] = strong
+#                 else:
+#                     result[i, j] = 0
+
+#     return result
+
+
+
+
+
+# A* Pathfinding (unchanged behavior)
 def get_neighbors(pos, rows, cols):
     r, c = pos
     neighbors = []
@@ -95,7 +193,7 @@ def get_neighbors(pos, rows, cols):
 def heuristic(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
-def astar_pathfinding(cost_map: np.ndarray, start, goal):
+def astar_pathfinding(cost_map, start, goal):
     rows, cols = cost_map.shape
     open_set = [(0.0, start)]
     came_from = {}
@@ -118,7 +216,7 @@ def astar_pathfinding(cost_map: np.ndarray, start, goal):
                 heapq.heappush(open_set, (f_score[neighbor], neighbor))
     return []
 
-def slope_to_clock_if(m_img: float) -> str:
+def slope_to_clock_if(m_img):
     m_math = -m_img
     vx, vy = (1.0, m_math) if m_math >= 0 else (-1.0, -m_math)
     angle = np.degrees(np.arctan2(vy, vx))
@@ -138,11 +236,11 @@ def slope_to_clock_if(m_img: float) -> str:
     return "9"
 
 
-# -----------------------------
+
 # MiDaS (TFLite) — load once
-# -----------------------------
+
 class MidasTFLite:
-    def __init__(self, model_path: str):
+    def __init__(self, model_path):
         model_path = Path(model_path)
         if not model_path.exists():
             raise FileNotFoundError(f"TFLite model not found: {model_path}")
@@ -155,13 +253,13 @@ class MidasTFLite:
         _, self.in_h, self.in_w, self.in_c = self.inp["shape"]
         self.in_dtype = self.inp["dtype"]
 
-    def preprocess(self, rgb: np.ndarray) -> np.ndarray:
+    def preprocess(self, rgb):
         resized = cv2.resize(rgb, (self.in_w, self.in_h), interpolation=cv2.INTER_AREA)
         if self.in_dtype == np.uint8:
             return resized[np.newaxis, ...].astype(np.uint8)
         return (resized.astype(np.float32) / 255.0)[np.newaxis, ...]
 
-    def postprocess(self, out_arr: np.ndarray, out_size_hw) -> np.ndarray:
+    def postprocess(self, out_arr, out_size_hw):
         x = out_arr
         if x.ndim == 4:
             if x.shape[-1] == 1:
@@ -181,7 +279,7 @@ class MidasTFLite:
         H, W = out_size_hw
         return cv2.resize(x, (W, H), interpolation=cv2.INTER_CUBIC)
 
-    def __call__(self, rgb: np.ndarray) -> np.ndarray:
+    def __call__(self, rgb):
         inp = self.preprocess(rgb)
         self.interpreter.set_tensor(self.inp["index"], inp)
         self.interpreter.invoke()
@@ -189,10 +287,7 @@ class MidasTFLite:
         return self.postprocess(out_arr, (rgb.shape[0], rgb.shape[1]))
 
 
-# -----------------------------
-# Helpers for web display
-# -----------------------------
-def to_data_url(img: np.ndarray, is_rgb: bool = True, max_w: int = 640) -> str:
+def to_data_url(img, is_rgb=True, max_w=640):
     """
     Encode an image (RGB or grayscale) as base64 PNG data URL.
     Downscale to max_w for lighter pages.
@@ -215,8 +310,7 @@ def to_data_url(img: np.ndarray, is_rgb: bool = True, max_w: int = 640) -> str:
     b64 = base64.b64encode(buf.tobytes()).decode("ascii")
     return f"data:image/png;base64,{b64}"
 
-
-def draw_arrow_overlay(img_rgb: np.ndarray, m_img: float) -> np.ndarray:
+def draw_arrow_overlay(img_rgb, m_img):
     h, w = img_rgb.shape[:2]
     c_img = (h - 1) - m_img * (w // 2)
     arrow_len = int(max(10, h / 3))
@@ -230,8 +324,7 @@ def draw_arrow_overlay(img_rgb: np.ndarray, m_img: float) -> np.ndarray:
     cv2.arrowedLine(out, (w // 2, h - 1), (x_end, y_end), (255, 255, 0), 3, tipLength=0.2)
     return out
 
-
-def make_patch_visual(patch01: np.ndarray, path_cells, cell_px: int = 28) -> np.ndarray:
+def make_patch_visual(patch01, path_cells, cell_px=28):
     """
     Visualize 15x15 patch heatmap (0..1) and overlay A* path in red.
     """
@@ -251,50 +344,45 @@ def make_patch_visual(patch01: np.ndarray, path_cells, cell_px: int = 28) -> np.
     return vis_rgb
 
 
-# -----------------------------
 # Pipeline (returns images + timings)
-# -----------------------------
-def process_image_array(img_rgb: np.ndarray, depth_net: MidasTFLite, clahe_clip: float, clahe_tiles: tuple[int, int]):
+def process_image_array(img_rgb, depth_net, clahe_clip, clahe_tiles):
+    """
+    New pipeline (as requested):
+      image -> CLAHE -> grayscale -> Canny -> depth -> depth+edge -> A* -> final path
+    """
     timings = {}
     images = {}
 
-    with measure(timings, "prep_gray"):
-        img_gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    # 0) Original
     images["Original"] = img_rgb
-    images["Grayscale"] = img_gray
 
+
+    # 1) CLAHE (on LAB-Lightness)
     with measure(timings, "clahe"):
         img_eq = apply_clahe_rgb_lab(img_rgb, clip_limit=clahe_clip, tile_grid_size=clahe_tiles)
     images["CLAHE (LAB L)"] = img_eq
 
-    with measure(timings, "fft_denoise_1"):
-        s1_gray = fft_denoise(cv2.cvtColor(img_eq, cv2.COLOR_RGB2GRAY))
-    images["FFT Denoise #1"] = s1_gray
+    # 2) Grayscale (from CLAHE result)
+    with measure(timings, "to_gray"):
+        img_gray = cv2.cvtColor(img_eq, cv2.COLOR_RGB2GRAY)
+    images["Grayscale"] = img_gray
 
-    with measure(timings, "log_kernel"):
-        log_kernel = LoG_Kernel_Generator(9, 1.0)
+    # 3) Edge detection (Canny)
+    with measure(timings, "canny_edges"):
+        canny_edges = cv2.Canny(img_gray, 100, 200, L2gradient=True)
+    images["Canny Edges"] = canny_edges
 
-    with measure(timings, "log_convolution"):
-        log_conv = cv2.filter2D(s1_gray.astype(np.float32), -1, log_kernel)
-    images["LoG Convolution"] = cv2.convertScaleAbs(log_conv)
-
-    with measure(timings, "edge_detection"):
-        edges = robust_laplacian_edge_detector(img_gray, log_conv, 150.0)
-    images["Edges (zero-cross)"] = edges
-
-    with measure(timings, "fft_denoise_2"):
-        s2_gray = fft_denoise(cv2.cvtColor(img_eq, cv2.COLOR_RGB2GRAY))
-        s2_rgb = cv2.cvtColor(s2_gray, cv2.COLOR_GRAY2RGB)
-    images["FFT Denoise #2"] = s2_gray
-
+    # 4) Depth (MiDaS) — run on CLAHE-enhanced RGB for better local contrast
     with measure(timings, "depth_inference_tflite"):
-        depth = depth_net(s2_rgb)
+        depth = depth_net(img_eq)
     images["Depth Map"] = depth
 
+    # 5) Combine depth with edges (edges force high cost/visibility as 255)
     with measure(timings, "combine_depth_edge"):
-        combined = np.where(edges > 0, 255, depth).astype(np.uint8)
+        combined = np.where(canny_edges > 0, 255, depth).astype(np.uint8)
     images["Depth + Edge"] = combined
 
+    # 6) Patchify (15x15) to produce a coarse cost map for A*
     with measure(timings, "patchify"):
         R, C = 15, 15
         h, w = combined.shape
@@ -305,13 +393,15 @@ def process_image_array(img_rgb: np.ndarray, depth_net: MidasTFLite, clahe_clip:
                 y1, y2 = r * ph, min((r + 1) * ph, h)
                 x1, x2 = c * pw, min((c + 1) * pw, w)
                 patch[r, c] = np.mean(combined[y1:y2, x1:x2])
-        patch01 = patch / 255.0  # 0..1
+        patch01 = patch / 255.0  # normalize to 0..1
 
+    # 7) A* pathfinding (start at bottom center; goal = lowest cost cell in top 5 rows)
     with measure(timings, "astar_pathfinding"):
         start = (R - 1, C // 2)
         goal = np.unravel_index(np.argmin(patch01[:5, :]), patch01[:5, :].shape)
         path = astar_pathfinding(patch01, start, goal) or [start, goal]
 
+    # 8) Direction & visualization
     with measure(timings, "slope_direction"):
         x_vals = np.array([c - start[1] for r, c in path])
         y_vals = np.array([r - start[0] for r, c in path])
@@ -319,33 +409,51 @@ def process_image_array(img_rgb: np.ndarray, depth_net: MidasTFLite, clahe_clip:
         m_img = (h / R) / (w / C) * m
         direction = slope_to_clock_if(m_img)
 
-    # visuals for path + arrow
     images["15x15 Patch + Path"] = make_patch_visual(patch01, path, cell_px=28)
     images["Arrow Overlay"] = draw_arrow_overlay(img_rgb, m_img)
 
+    # annotate total runtime (seconds) on the overlay image
     total = sum(timings.values())
+    overlay = images["Arrow Overlay"].copy()
+    cv2.putText(
+        overlay,
+        f"{total:.3f}s",
+        (12, 34),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    images["Arrow Overlay"] = overlay
+
     return {
         "direction": direction,
         "slope_m_img": float(m_img),
-        "timings_s": timings,
-        "total_s": total,
-        "images": images,  # dict of {title: np.ndarray}
+        "timings_s": timings,   # seconds per step
+        "total_s": total,       # total seconds
+        "images": images,       # dict of {title: np.ndarray}
     }
 
 
-def print_pipeline_report(image_label: str, result: dict):
-    print(f"\n🖼️ Image: {image_label}")
+# Report helpers (console)
+
+def print_pipeline_report(image_label, result):
+    print(f"\n Image: {image_label}")
     for k, v in result["timings_s"].items():
-        print(f"  {k:<22} {ms(v):8.2f} ms")
+        print(f"  {k:<22} {v:8.3f} s")
     print(f"  {'-'*35}")
-    print(f"  TOTAL{'':17} {ms(result['total_s']):8.2f} ms | Direction: {result['direction']} | Slope: {result['slope_m_img']:.4f}")
+    print(
+        f"  TOTAL{'':17} {result['total_s']:8.3f} s | "
+        f"Direction: {result['direction']} | Slope: {result['slope_m_img']:.4f}"
+    )
 
 
-# -----------------------------
-# Flask App
-# -----------------------------
+# ------------------------------------
+# Flask App (routes)
+# ------------------------------------
 app = Flask(__name__)
-MODEL_PATH = os.environ.get("MIDAS_TFLITE", "models/Midas-V2.tflite")
+
 print("Loading model once...", end=" ", flush=True)
 _t0 = time.perf_counter()
 depth_net = MidasTFLite(MODEL_PATH)  # load once at startup
@@ -354,8 +462,10 @@ print(f"done ({ms(time.perf_counter()-_t0):.1f} ms).")
 
 @app.get("/")
 def index():
-    return render_template("index.html", defaults={"clahe_clip": 2.0, "tile_w": 8, "tile_h": 8})
-
+    return render_template(
+        "index.html",
+        defaults={"clahe_clip": DEFAULT_CLAHE_CLIP, "tile_w": DEFAULT_TILE_W, "tile_h": DEFAULT_TILE_H},
+    )
 
 def _read_image_from_request(file_storage):
     file_bytes = np.frombuffer(file_storage.read(), np.uint8)
@@ -374,9 +484,9 @@ def process_form():
         abort(400, "No file selected")
 
     try:
-        clahe_clip = float(request.form.get("clahe_clip", 2.0))
-        tile_w = int(request.form.get("tile_w", 8))
-        tile_h = int(request.form.get("tile_h", 8))
+        clahe_clip = float(request.form.get("clahe_clip", DEFAULT_CLAHE_CLIP))
+        tile_w = int(request.form.get("tile_w", DEFAULT_TILE_W))
+        tile_h = int(request.form.get("tile_h", DEFAULT_TILE_H))
     except Exception:
         abort(400, "Invalid CLAHE parameters")
 
@@ -386,30 +496,30 @@ def process_form():
 
     result = process_image_array(img_rgb, depth_net, clahe_clip, (tile_w, tile_h))
 
-    # PRINT to terminal
+    # print to terminal
     print_pipeline_report(image_label=f.filename or "upload", result=result)
 
-    # Convert all intermediates to data URLs
+    # convert intermediates to data URLs
     image_cards = []
     for title, arr in result["images"].items():
         is_rgb = (arr.ndim == 3)
         data_url = to_data_url(arr, is_rgb=is_rgb, max_w=700)
         image_cards.append({"title": title, "data_url": data_url})
 
-    # Show a result page with the intermediate images + timings
-    timings_rows = [(k, f"{ms(v):.2f}") for k, v in result["timings_s"].items()]
+    # render result page
+    timings_rows = [(k, f"{v:.3f}") for k, v in result["timings_s"].items()]
     return render_template(
         "result.html",
         direction=result["direction"],
         slope=f"{result['slope_m_img']:.4f}",
-        total_ms=f"{ms(result['total_s']):.2f}",
-        timings=timings_rows,
+        total_ms=f"{result['total_s']:.3f}",  # seconds value
+        timings=timings_rows,                  # seconds per step
         params={"clahe_clip": clahe_clip, "tile_w": tile_w, "tile_h": tile_h},
         images=image_cards,
     )
 
 
-# Optional JSON API (prints to terminal too)
+
 @app.post("/api/process")
 def process_api():
     if "image" not in request.files:
@@ -417,9 +527,9 @@ def process_api():
     f = request.files["image"]
 
     try:
-        clahe_clip = float(request.form.get("clahe_clip", 2.0))
-        tile_w = int(request.form.get("tile_w", 8))
-        tile_h = int(request.form.get("tile_h", 8))
+        clahe_clip = float(request.form.get("clahe_clip", DEFAULT_CLAHE_CLIP))
+        tile_w = int(request.form.get("tile_w", DEFAULT_TILE_W))
+        tile_h = int(request.form.get("tile_h", DEFAULT_TILE_H))
     except Exception:
         return jsonify({"error": "Invalid CLAHE parameters"}), 400
 
@@ -430,7 +540,7 @@ def process_api():
     result = process_image_array(img_rgb, depth_net, clahe_clip, (tile_w, tile_h))
     print_pipeline_report(image_label=f.filename or "upload(api)", result=result)
 
-    # also return base64 intermediates if you want (comment out if not needed)
+    # include base64 intermediates
     images64 = {}
     for title, arr in result["images"].items():
         is_rgb = (arr.ndim == 3)
@@ -440,13 +550,13 @@ def process_api():
         {
             "direction": result["direction"],
             "slope_m_img": result["slope_m_img"],
-            "total_ms": ms(result["total_s"]),
-            "steps_ms": {k: ms(v) for k, v in result["timings_s"].items()},
+            "total_s": result["total_s"],       # seconds
+            "steps_s": result["timings_s"],     # seconds per step
             "images": images64,
         }
     )
 
 
 if __name__ == "__main__":
-    # Run local dev server: python app.py
     app.run(host="0.0.0.0", port=5000, debug=True)
+
