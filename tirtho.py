@@ -2,6 +2,8 @@ import os
 import math
 import heapq
 import time
+import base64
+from io import BytesIO
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -31,17 +33,12 @@ def measure(timings: dict, key: str):
 
 
 # -----------------------------
-# Core Ops (same names, faster impls)
+# Core Ops (fast impls; keep names)
 # -----------------------------
 def fft_denoise(image: np.ndarray, keep_fraction: float = 0.1) -> np.ndarray:
-    """
-    FAST replacement for FFT low-pass: OpenCV Gaussian blur (vectorized, C++).
-    Smaller keep_fraction -> stronger blur (larger sigma).
-    """
     kf = float(np.clip(keep_fraction, 0.01, 0.99))
-    sigma = 0.6 + (1.0 - kf) * 3.4  # keep_fraction=0.1 -> ~3.66
+    sigma = 0.6 + (1.0 - kf) * 3.4
     return cv2.GaussianBlur(image, (0, 0), sigmaX=sigma, sigmaY=sigma, borderType=cv2.BORDER_REPLICATE)
-
 
 def apply_clahe_rgb_lab(image_rgb: np.ndarray, clip_limit: float = 2.0, tile_grid_size=(8, 8)) -> np.ndarray:
     lab = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2LAB)
@@ -51,11 +48,9 @@ def apply_clahe_rgb_lab(image_rgb: np.ndarray, clip_limit: float = 2.0, tile_gri
     lab_eq = cv2.merge([l_eq, a, b])
     return cv2.cvtColor(lab_eq, cv2.COLOR_LAB2RGB)
 
-
 def LoG(x: float, y: float, sigma: float) -> float:
     r2 = x**2 + y**2
     return -1.0 / (math.pi * sigma**4) * (1.0 - r2 / (2.0 * sigma**2)) * math.exp(-r2 / (2.0 * sigma**2))
-
 
 def LoG_Kernel_Generator(size: int, sigma: float) -> np.ndarray:
     k = size // 2
@@ -64,7 +59,6 @@ def LoG_Kernel_Generator(size: int, sigma: float) -> np.ndarray:
         for dx in range(-k, k + 1):
             kernel[dy + k, dx + k] = LoG(dx, dy, sigma)
     return kernel
-
 
 def local_variance_cv(image: np.ndarray, ksize: int = 3) -> np.ndarray:
     image = image.astype(np.float32)
@@ -75,21 +69,12 @@ def local_variance_cv(image: np.ndarray, ksize: int = 3) -> np.ndarray:
     variance[:pad, :] = variance[-pad:, :] = variance[:, :pad] = variance[:, -pad:] = 0
     return variance
 
-
 def robust_laplacian_edge_detector(image_gray: np.ndarray, log_image: np.ndarray, threshold_value: float) -> np.ndarray:
-    """
-    Vectorized zero-crossing + variance gating (no Python loops).
-    """
     variance_image = local_variance_cv(image_gray, 3)
-
-    # zero-crossings (center region)
     zc_vert = (log_image[2:, 1:-1] * log_image[:-2, 1:-1]) < 0
     zc_horz = (log_image[1:-1, 2:] * log_image[1:-1, :-2]) < 0
     zc = np.logical_or(zc_vert, zc_horz)
-
-    # variance gate
     var_gate = variance_image[1:-1, 1:-1] > threshold_value
-
     edges = np.zeros_like(image_gray, dtype=np.uint8)
     edges[1:-1, 1:-1] = (zc & var_gate).astype(np.uint8) * 255
     return edges
@@ -107,10 +92,8 @@ def get_neighbors(pos, rows, cols):
             neighbors.append((nr, nc))
     return neighbors
 
-
 def heuristic(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
-
 
 def astar_pathfinding(cost_map: np.ndarray, start, goal):
     rows, cols = cost_map.shape
@@ -134,7 +117,6 @@ def astar_pathfinding(cost_map: np.ndarray, start, goal):
                 f_score[neighbor] = tentative_g + heuristic(neighbor, goal)
                 heapq.heappush(open_set, (f_score[neighbor], neighbor))
     return []
-
 
 def slope_to_clock_if(m_img: float) -> str:
     m_math = -m_img
@@ -208,57 +190,127 @@ class MidasTFLite:
 
 
 # -----------------------------
-# Pipeline (array input)
+# Helpers for web display
+# -----------------------------
+def to_data_url(img: np.ndarray, is_rgb: bool = True, max_w: int = 640) -> str:
+    """
+    Encode an image (RGB or grayscale) as base64 PNG data URL.
+    Downscale to max_w for lighter pages.
+    """
+    if img.ndim == 3 and is_rgb:
+        h, w = img.shape[:2]
+        if w > max_w:
+            new_h = int(h * max_w / w)
+            img = cv2.resize(img, (max_w, new_h), interpolation=cv2.INTER_AREA)
+        bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        ok, buf = cv2.imencode(".png", bgr)
+    else:
+        h, w = img.shape[:2]
+        if w > max_w:
+            new_h = int(h * max_w / w)
+            img = cv2.resize(img, (max_w, new_h), interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".png", img)
+    if not ok:
+        raise RuntimeError("Failed to encode image to PNG")
+    b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+
+def draw_arrow_overlay(img_rgb: np.ndarray, m_img: float) -> np.ndarray:
+    h, w = img_rgb.shape[:2]
+    c_img = (h - 1) - m_img * (w // 2)
+    arrow_len = int(max(10, h / 3))
+    y_end = max(h - 1 - arrow_len, 0)
+    if abs(m_img) < 1e-6:
+        x_end = w // 2
+    else:
+        x_end = int((y_end - c_img) / m_img)
+    x_end = int(np.clip(x_end, 0, w - 1))
+    out = img_rgb.copy()
+    cv2.arrowedLine(out, (w // 2, h - 1), (x_end, y_end), (255, 255, 0), 3, tipLength=0.2)
+    return out
+
+
+def make_patch_visual(patch01: np.ndarray, path_cells, cell_px: int = 28) -> np.ndarray:
+    """
+    Visualize 15x15 patch heatmap (0..1) and overlay A* path in red.
+    """
+    R, C = patch01.shape
+    vis = (patch01 * 255.0).astype(np.uint8)
+    vis = cv2.resize(vis, (C * cell_px, R * cell_px), interpolation=cv2.INTER_NEAREST)
+    vis_rgb = cv2.cvtColor(vis, cv2.COLOR_GRAY2RGB)
+
+    def cell_center(rc):
+        r, c = rc
+        return (int(c * cell_px + cell_px / 2), int(r * cell_px + cell_px / 2))
+
+    for i in range(1, len(path_cells)):
+        p1 = cell_center(path_cells[i - 1])
+        p2 = cell_center(path_cells[i])
+        cv2.line(vis_rgb, p1, p2, (255, 0, 0), 2)
+    return vis_rgb
+
+
+# -----------------------------
+# Pipeline (returns images + timings)
 # -----------------------------
 def process_image_array(img_rgb: np.ndarray, depth_net: MidasTFLite, clahe_clip: float, clahe_tiles: tuple[int, int]):
     timings = {}
+    images = {}
 
     with measure(timings, "prep_gray"):
         img_gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    images["Original"] = img_rgb
+    images["Grayscale"] = img_gray
 
     with measure(timings, "clahe"):
         img_eq = apply_clahe_rgb_lab(img_rgb, clip_limit=clahe_clip, tile_grid_size=clahe_tiles)
+    images["CLAHE (LAB L)"] = img_eq
 
     with measure(timings, "fft_denoise_1"):
         s1_gray = fft_denoise(cv2.cvtColor(img_eq, cv2.COLOR_RGB2GRAY))
+    images["FFT Denoise #1"] = s1_gray
 
     with measure(timings, "log_kernel"):
         log_kernel = LoG_Kernel_Generator(9, 1.0)
 
     with measure(timings, "log_convolution"):
         log_conv = cv2.filter2D(s1_gray.astype(np.float32), -1, log_kernel)
+    images["LoG Convolution"] = cv2.convertScaleAbs(log_conv)
 
     with measure(timings, "edge_detection"):
         edges = robust_laplacian_edge_detector(img_gray, log_conv, 150.0)
+    images["Edges (zero-cross)"] = edges
 
     with measure(timings, "fft_denoise_2"):
         s2_gray = fft_denoise(cv2.cvtColor(img_eq, cv2.COLOR_RGB2GRAY))
         s2_rgb = cv2.cvtColor(s2_gray, cv2.COLOR_GRAY2RGB)
+    images["FFT Denoise #2"] = s2_gray
 
     with measure(timings, "depth_inference_tflite"):
         depth = depth_net(s2_rgb)
+    images["Depth Map"] = depth
 
     with measure(timings, "combine_depth_edge"):
         combined = np.where(edges > 0, 255, depth).astype(np.uint8)
+    images["Depth + Edge"] = combined
 
     with measure(timings, "patchify"):
         R, C = 15, 15
         h, w = combined.shape
-        patch = np.zeros((R, C))
+        patch = np.zeros((R, C), dtype=np.float32)
         ph, pw = h // R, w // C
         for r in range(R):
             for c in range(C):
                 y1, y2 = r * ph, min((r + 1) * ph, h)
                 x1, x2 = c * pw, min((c + 1) * pw, w)
                 patch[r, c] = np.mean(combined[y1:y2, x1:x2])
-        patch /= 255.0
+        patch01 = patch / 255.0  # 0..1
 
     with measure(timings, "astar_pathfinding"):
         start = (R - 1, C // 2)
-        goal = np.unravel_index(np.argmin(patch[:5, :]), patch[:5, :].shape)
-        path = astar_pathfinding(patch, start, goal)
-        if not path:
-            path = [start, goal]
+        goal = np.unravel_index(np.argmin(patch01[:5, :]), patch01[:5, :].shape)
+        path = astar_pathfinding(patch01, start, goal) or [start, goal]
 
     with measure(timings, "slope_direction"):
         x_vals = np.array([c - start[1] for r, c in path])
@@ -267,12 +319,17 @@ def process_image_array(img_rgb: np.ndarray, depth_net: MidasTFLite, clahe_clip:
         m_img = (h / R) / (w / C) * m
         direction = slope_to_clock_if(m_img)
 
+    # visuals for path + arrow
+    images["15x15 Patch + Path"] = make_patch_visual(patch01, path, cell_px=28)
+    images["Arrow Overlay"] = draw_arrow_overlay(img_rgb, m_img)
+
     total = sum(timings.values())
     return {
         "direction": direction,
         "slope_m_img": float(m_img),
         "timings_s": timings,
         "total_s": total,
+        "images": images,  # dict of {title: np.ndarray}
     }
 
 
@@ -301,7 +358,6 @@ def index():
 
 
 def _read_image_from_request(file_storage):
-    # Read bytes → np array (BGR) → RGB
     file_bytes = np.frombuffer(file_storage.read(), np.uint8)
     bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
     if bgr is None:
@@ -317,7 +373,6 @@ def process_form():
     if f.filename == "":
         abort(400, "No file selected")
 
-    # parameters
     try:
         clahe_clip = float(request.form.get("clahe_clip", 2.0))
         tile_w = int(request.form.get("tile_w", 8))
@@ -325,7 +380,6 @@ def process_form():
     except Exception:
         abort(400, "Invalid CLAHE parameters")
 
-    # image -> pipeline
     img_rgb = _read_image_from_request(f)
     if img_rgb is None:
         abort(400, "Could not decode image")
@@ -335,11 +389,27 @@ def process_form():
     # PRINT to terminal
     print_pipeline_report(image_label=f.filename or "upload", result=result)
 
-    # go back to the same index page
-    return redirect(url_for("index"))
+    # Convert all intermediates to data URLs
+    image_cards = []
+    for title, arr in result["images"].items():
+        is_rgb = (arr.ndim == 3)
+        data_url = to_data_url(arr, is_rgb=is_rgb, max_w=700)
+        image_cards.append({"title": title, "data_url": data_url})
+
+    # Show a result page with the intermediate images + timings
+    timings_rows = [(k, f"{ms(v):.2f}") for k, v in result["timings_s"].items()]
+    return render_template(
+        "result.html",
+        direction=result["direction"],
+        slope=f"{result['slope_m_img']:.4f}",
+        total_ms=f"{ms(result['total_s']):.2f}",
+        timings=timings_rows,
+        params={"clahe_clip": clahe_clip, "tile_w": tile_w, "tile_h": tile_h},
+        images=image_cards,
+    )
 
 
-# Optional: JSON API, also prints to terminal
+# Optional JSON API (prints to terminal too)
 @app.post("/api/process")
 def process_api():
     if "image" not in request.files:
@@ -359,12 +429,20 @@ def process_api():
 
     result = process_image_array(img_rgb, depth_net, clahe_clip, (tile_w, tile_h))
     print_pipeline_report(image_label=f.filename or "upload(api)", result=result)
+
+    # also return base64 intermediates if you want (comment out if not needed)
+    images64 = {}
+    for title, arr in result["images"].items():
+        is_rgb = (arr.ndim == 3)
+        images64[title] = to_data_url(arr, is_rgb=is_rgb, max_w=512)
+
     return jsonify(
         {
             "direction": result["direction"],
             "slope_m_img": result["slope_m_img"],
             "total_ms": ms(result["total_s"]),
             "steps_ms": {k: ms(v) for k, v in result["timings_s"].items()},
+            "images": images64,
         }
     )
 
