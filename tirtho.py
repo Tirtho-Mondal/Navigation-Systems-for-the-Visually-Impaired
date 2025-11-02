@@ -1,6 +1,4 @@
 import argparse
-import csv
-import json
 import math
 import heapq
 import time
@@ -12,9 +10,6 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 
-# -----------------------------
-# TFLite interpreter (tflite-runtime preferred; falls back to TF)
-# -----------------------------
 try:
     from tflite_runtime.interpreter import Interpreter
 except Exception:
@@ -48,7 +43,7 @@ def fft_denoise(image: np.ndarray, keep_fraction: float = 0.1) -> np.ndarray:
     mask = np.zeros((rows, cols), np.float32)
     keep_r = max(1, int(rows * keep_fraction / 2))
     keep_c = max(1, int(cols * keep_fraction / 2))
-    mask[crow - keep_r : crow + keep_r, ccol - keep_c : ccol + keep_c] = 1.0
+    mask[crow - keep_r:crow + keep_r, ccol - keep_c:ccol + keep_c] = 1.0
     fshift_filtered = fshift * mask
     f_ishift = np.fft.ifftshift(fshift_filtered)
     img_back = np.fft.ifft2(f_ishift)
@@ -57,7 +52,6 @@ def fft_denoise(image: np.ndarray, keep_fraction: float = 0.1) -> np.ndarray:
 
 
 def apply_clahe_rgb_lab(image_rgb: np.ndarray, clip_limit: float = 2.0, tile_grid_size=(8, 8)) -> np.ndarray:
-    # CLAHE on L channel in LAB (keeps colors natural)
     lab = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=float(clip_limit), tileGridSize=tuple(tile_grid_size))
@@ -163,15 +157,11 @@ def slope_to_clock_if(m_img: float) -> str:
 
 
 # -----------------------------
-# MiDaS (TFLite) loader + inference
+# MiDaS (TFLite)
 # -----------------------------
 class MidasTFLite:
-    """Load once and reuse for all images."""
     def __init__(self, model_path: str):
-        model_p = Path(model_path)
-        if not model_p.exists():
-            raise FileNotFoundError(f"TFLite model not found at: {model_p}")
-        self.interpreter = Interpreter(model_path=str(model_p))
+        self.interpreter = Interpreter(model_path=str(model_path))
         self.interpreter.allocate_tensors()
         self.input_details = self.interpreter.get_input_details()
         self.output_details = self.interpreter.get_output_details()
@@ -187,20 +177,11 @@ class MidasTFLite:
         return (resized.astype(np.float32) / 255.0)[np.newaxis, ...]
 
     def postprocess(self, out_arr: np.ndarray, out_size_hw) -> np.ndarray:
-        x = out_arr
-        if x.ndim == 4:
-            if x.shape[-1] == 1:
-                x = x[0, :, :, 0]
-            elif x.shape[1] == 1:
-                x = x[0, 0, :, :]
-            else:
-                x = x[0]
-        elif x.ndim == 3:
-            x = x[0]
+        x = out_arr[0]
         x = x.astype(np.float32)
         mn, mx = float(x.min()), float(x.max())
         if mx - mn < 1e-9:
-            x = np.zeros_like(x, dtype=np.uint8)
+            x[:] = 0
         else:
             x = (255.0 * (x - mn) / (mx - mn)).astype(np.uint8)
         H, W = out_size_hw
@@ -215,23 +196,15 @@ class MidasTFLite:
 
 
 # -----------------------------
-# One-image pipeline (reuses depth_net)
+# One-image pipeline
 # -----------------------------
-def process_image(
-    image_path: Path,
-    depth_net: MidasTFLite,
-    out_dir: Path,
-    plot: bool,
-    clahe_clip: float,
-    clahe_tiles: tuple[int, int],
-):
+def process_image(image_path: Path, depth_net: MidasTFLite, clahe_clip: float, clahe_tiles: tuple[int, int]):
     timings = {}
-    stem = image_path.stem
-
     with measure(timings, "read_image"):
         img_bgr = cv2.imread(str(image_path))
         if img_bgr is None:
-            raise ValueError(f"Failed to read image: {image_path}")
+            print(f"Failed to read {image_path}")
+            return
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         img_gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
 
@@ -239,239 +212,96 @@ def process_image(
         img_eq = apply_clahe_rgb_lab(img_rgb, clip_limit=clahe_clip, tile_grid_size=clahe_tiles)
 
     with measure(timings, "fft_denoise_1"):
-        smooth1_gray = fft_denoise(cv2.cvtColor(img_eq, cv2.COLOR_RGB2GRAY), keep_fraction=0.1)
-        smooth1_rgb = cv2.cvtColor(smooth1_gray, cv2.COLOR_GRAY2RGB)
+        s1_gray = fft_denoise(cv2.cvtColor(img_eq, cv2.COLOR_RGB2GRAY))
 
     with measure(timings, "log_kernel"):
-        sigma = 1.0
-        kernel_size = int(max(3, (9 * sigma))) | 1
-        log_kernel = LoG_Kernel_Generator(kernel_size, sigma)
+        log_kernel = LoG_Kernel_Generator(9, 1.0)
 
     with measure(timings, "log_convolution"):
-        log_conv = cv2.filter2D(smooth1_gray.astype(np.float32), ddepth=-1, kernel=log_kernel)
+        log_conv = cv2.filter2D(s1_gray.astype(np.float32), -1, log_kernel)
 
     with measure(timings, "edge_detection"):
-        edges = robust_laplacian_edge_detector(img_gray, log_conv, threshold_value=150.0)
+        edges = robust_laplacian_edge_detector(img_gray, log_conv, 150.0)
 
     with measure(timings, "fft_denoise_2"):
-        smooth2_gray = fft_denoise(cv2.cvtColor(img_eq, cv2.COLOR_RGB2GRAY), keep_fraction=0.1)
-        smooth2_rgb = cv2.cvtColor(smooth2_gray, cv2.COLOR_GRAY2RGB)
+        s2_gray = fft_denoise(cv2.cvtColor(img_eq, cv2.COLOR_RGB2GRAY))
+        s2_rgb = cv2.cvtColor(s2_gray, cv2.COLOR_GRAY2RGB)
 
     with measure(timings, "depth_inference_tflite"):
-        depth = depth_net(smooth2_rgb)
+        depth = depth_net(s2_rgb)
 
     with measure(timings, "combine_depth_edge"):
         combined = np.where(edges > 0, 255, depth).astype(np.uint8)
 
     with measure(timings, "patchify"):
-        PATCH_ROWS, PATCH_COLS = 15, 15
+        R, C = 15, 15
         h, w = combined.shape
-        patch_h = max(1, h // PATCH_ROWS)
-        patch_w = max(1, w // PATCH_COLS)
-        combo_patch = np.zeros((PATCH_ROWS, PATCH_COLS), dtype=np.float32)
-        for r in range(PATCH_ROWS):
-            for c in range(PATCH_COLS):
-                y1, y2 = r * patch_h, min((r + 1) * patch_h, h)
-                x1, x2 = c * patch_w, min((c + 1) * patch_w, w)
-                patch = combined[y1:y2, x1:x2]
-                combo_patch[r, c] = float(np.mean(patch)) if patch.size else 0.0
-        combo_patch_f = combo_patch / 255.0
+        patch = np.zeros((R, C))
+        ph, pw = h // R, w // C
+        for r in range(R):
+            for c in range(C):
+                y1, y2 = r * ph, min((r + 1) * ph, h)
+                x1, x2 = c * pw, min((c + 1) * pw, w)
+                patch[r, c] = np.mean(combined[y1:y2, x1:x2])
+        patch /= 255.0
 
     with measure(timings, "astar_pathfinding"):
-        start = (PATCH_ROWS - 1, PATCH_COLS // 2)
-        goal_region = combo_patch_f[:5, :]
-        goal = np.unravel_index(np.argmin(goal_region), goal_region.shape)
-        path = astar_pathfinding(combo_patch_f, start, goal)
+        start = (R - 1, C // 2)
+        goal = np.unravel_index(np.argmin(patch[:5, :]), patch[:5, :].shape)
+        path = astar_pathfinding(patch, start, goal)
         if not path:
             path = [start, goal]
 
     with measure(timings, "slope_direction"):
-        x_vals = np.array([c - start[1] for r, c in path], dtype=np.float32)
-        y_vals = np.array([r - start[0] for r, c in path], dtype=np.float32)
-        denom = float(np.sum(x_vals**2) + 1e-6)
-        m = float(np.sum(x_vals * y_vals) / denom)
-        m_img = (h / PATCH_ROWS) / (w / PATCH_COLS) * m
-        c_img = (h - 1) - m_img * (w // 2)
+        x_vals = np.array([c - start[1] for r, c in path])
+        y_vals = np.array([r - start[0] for r, c in path])
+        m = np.sum(x_vals * y_vals) / (np.sum(x_vals**2) + 1e-6)
+        m_img = (h / R) / (w / C) * m
         direction = slope_to_clock_if(m_img)
 
-    with measure(timings, "draw_arrow"):
-        img_arrow = img_rgb.copy()
-        arrow_len = int(max(10, h / 3))
-        y_end = max(h - 1 - arrow_len, 0)
-        if abs(m_img) < 1e-6:
-            x_end = w // 2
-        else:
-            x_end = int((y_end - c_img) / m_img)
-        x_end = int(np.clip(x_end, 0, w - 1))
-        cv2.arrowedLine(img_arrow, (w // 2, h - 1), (x_end, y_end), (255, 255, 0), 3, tipLength=0.2)
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    with measure(timings, "save_arrow_png"):
-        (out_dir / f"{stem}_arrow.png").write_bytes(
-            cv2.imencode(".png", cv2.cvtColor(img_arrow, cv2.COLOR_RGB2BGR))[1]
-        )
-
-    if plot:
-        with measure(timings, "plot_and_save_grid"):
-            images = [img_rgb, img_eq, smooth1_rgb, edges, depth, combined, combo_patch, img_arrow]
-            titles = [
-                "Original",
-                "CLAHE (LAB L)",
-                "FFT Denoise #1",
-                "Edges (LoG)",
-                "Depth Map",
-                "Depth + Edge",
-                "15x15 Patch + Path",
-                f"Clock: {direction} (m={m_img:.3f})",
-            ]
-            fig, axes = plt.subplots(1, 8, figsize=(42, 5))
-            for col_idx, (im, title) in enumerate(zip(images, titles)):
-                ax = axes[col_idx]
-                if isinstance(im, np.ndarray) and im.ndim == 2:
-                    ax.imshow(im, cmap="gray")
-                else:
-                    ax.imshow(im)
-                ax.set_title(title)
-                ax.axis("off")
-            fig.suptitle(
-                "Pipeline: CLAHE → FFT Denoise → Edge → FFT Denoise → Depth (TFLite) → Combine → Patch → A* → Clock",
-                fontsize=16,
-            )
-            plt.tight_layout(rect=[0, 0, 1, 0.92])
-            fig_path = out_dir / f"{stem}_pipeline.png"
-            plt.savefig(fig_path.as_posix(), dpi=150)
-            plt.close(fig)
-
-    # return details needed by caller
     total = sum(timings.values())
-    return {
-        "image": image_path.name,
-        "direction": direction,
-        "slope_m_img": float(m_img),
-        "timings_s": timings,
-        "total_s": total,
-    }
+    print(f"\n🖼️ Image: {image_path.name}")
+    for k, v in timings.items():
+        print(f"  {k:<22} {ms(v):8.2f} ms")
+    print(f"  {'-'*35}")
+    print(f"  TOTAL{'':17} {ms(total):8.2f} ms | Direction: {direction}")
+    return total
 
 
 # -----------------------------
 # Batch driver
 # -----------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Batch process images with single-time TFLite model load (CLAHE + timings).")
-    ap.add_argument("--images", type=str, default="assets/*.jpg", help="Glob for input images, e.g. 'assets/*.jpg'")
-    ap.add_argument("--model", type=str, default="models/Midas-V2.tflite", help="Path to TFLite model")
-    ap.add_argument("--outdir", type=str, default="outputs", help="Directory to save outputs & timings")
-    ap.add_argument("--no-plot", action="store_true", help="Skip plotting to speed up")
-    ap.add_argument("--clahe-clip", type=float, default=2.0, help="CLAHE clipLimit (default: 2.0)")
-    ap.add_argument("--clahe-tiles", type=int, nargs=2, metavar=("TILE_W", "TILE_H"), default=(8, 8),
-                    help="CLAHE tileGridSize as two ints (default: 8 8)")
+    ap = argparse.ArgumentParser(description="Process multiple images, print timings, and reuse TFLite model once.")
+    ap.add_argument("--images", type=str, default="assets/*.jpg")
+    ap.add_argument("--model", type=str, default="models/Midas-V2.tflite")
+    ap.add_argument("--clahe-clip", type=float, default=2.0)
+    ap.add_argument("--clahe-tiles", type=int, nargs=2, default=(8, 8))
     args = ap.parse_args()
 
-    out_dir = Path(args.outdir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Collect images
     files = sorted(glob(args.images))
-    files = [Path(f) for f in files if Path(f).is_file()]
     if not files:
-        raise FileNotFoundError(f"No images matched: {args.images}")
+        print("No images found.")
+        return
 
-    # Load model ONCE
-    global_timings = {}
-    with measure(global_timings, "load_model"):
-        depth_net = MidasTFLite(args.model)
+    print(f"Loading model once... ", end="", flush=True)
+    t0 = time.perf_counter()
+    depth_net = MidasTFLite(args.model)
+    print(f"done ({ms(time.perf_counter() - t0):.1f} ms).")
 
-    # Process each image reusing the same interpreter
-    results = []
-    for p in files:
+    totals = []
+    for img_path in files:
         try:
-            res = process_image(
-                image_path=p,
-                depth_net=depth_net,
-                out_dir=out_dir,
-                plot=(not args.no_plot),
-                clahe_clip=args.clahe_clip,
-                clahe_tiles=tuple(args.clahe_tiles),
-            )
-            results.append(res)
-            # save per-image timings quickly too
-            stem = p.stem
-            # CSV
-            csv_path = out_dir / f"{stem}_timings.csv"
-            total = res["total_s"]
-            with csv_path.open("w", newline="") as f:
-                w = csv.writer(f)
-                w.writerow(["step", "time_ms", "percent"])
-                for k, v in res["timings_s"].items():
-                    pct = (v / total * 100.0) if total > 0 else 0.0
-                    w.writerow([k, f"{ms(v):.3f}", f"{pct:.3f}"])
-                w.writerow(["TOTAL", f"{ms(total):.3f}", "100.000"])
-            # JSON
-            json_path = out_dir / f"{stem}_timings.json"
-            with json_path.open("w") as f:
-                json.dump(
-                    {
-                        "image": res["image"],
-                        "direction": res["direction"],
-                        "slope_m_img": res["slope_m_img"],
-                        "steps_ms": {k: ms(v) for k, v in res["timings_s"].items()},
-                        "total_ms": ms(total),
-                    },
-                    f,
-                    indent=2,
-                )
-
+            total = process_image(Path(img_path), depth_net, args.clahe_clip, tuple(args.clahe_tiles))
+            totals.append(total)
         except Exception as e:
-            print(f"[WARN] Skipping {p.name}: {e}")
+            print(f"⚠️ Skipped {img_path}: {e}")
 
-    # ---- Batch-level reports ----
-    # Big CSV with every image+step
-    batch_csv = out_dir / "batch_timings.csv"
-    with batch_csv.open("w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["image", "step", "time_ms", "percent_of_image"])
-        for res in results:
-            total = res["total_s"]
-            for k, v in res["timings_s"].items():
-                pct = (v / total * 100.0) if total > 0 else 0.0
-                w.writerow([res["image"], k, f"{ms(v):.3f}", f"{pct:.3f}"])
-            w.writerow([res["image"], "TOTAL", f"{ms(total):.3f}", "100.000"])
-        # add a global row for model load (applies to whole batch)
-        w.writerow(["(global)", "load_model_once", f"{ms(global_timings['load_model']):.3f}", "n/a"])
-
-    # Compact summary
-    batch_summary = out_dir / "batch_summary.csv"
-    with batch_summary.open("w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["image", "direction", "slope_m_img", "total_ms"])
-        for res in results:
-            w.writerow([res["image"], res["direction"], f"{res['slope_m_img']:.4f}", f"{ms(res['total_s']):.3f}"])
-
-    # JSON overview
-    overview_json = out_dir / "batch_overview.json"
-    with overview_json.open("w") as f:
-        json.dump(
-            {
-                "model_load_ms": ms(global_timings["load_model"]),
-                "images": [
-                    {
-                        "image": r["image"],
-                        "direction": r["direction"],
-                        "slope_m_img": r["slope_m_img"],
-                        "total_ms": ms(r["total_s"]),
-                        "steps_ms": {k: ms(v) for k, v in r["timings_s"].items()},
-                    }
-                    for r in results
-                ],
-            },
-            f,
-            indent=2,
-        )
-
-    print(f"\nLoaded model once in {ms(global_timings['load_model']):.2f} ms.")
-    print(f"Processed {len(results)} image(s).")
-    print(f"Wrote:\n - {batch_csv}\n - {batch_summary}\n - {overview_json}\nOutputs and per-image files are in: {out_dir}")
+    if totals:
+        avg = ms(np.mean(totals))
+        print(f"\n✅ Processed {len(totals)} image(s). Avg total per image: {avg:.2f} ms.")
+    else:
+        print("No images processed.")
 
 
 if __name__ == "__main__":
