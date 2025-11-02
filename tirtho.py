@@ -1,14 +1,13 @@
-import argparse
+import os
 import math
 import heapq
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from glob import glob
 
+from flask import Flask, render_template, request, jsonify, abort, redirect, url_for
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 
 try:
     from tflite_runtime.interpreter import Interpreter
@@ -32,18 +31,15 @@ def measure(timings: dict, key: str):
 
 
 # -----------------------------
-# Core Ops
+# Core Ops (same names, faster impls)
 # -----------------------------
 def fft_denoise(image: np.ndarray, keep_fraction: float = 0.1) -> np.ndarray:
     """
-    FAST replacement for the original FFT-based low-pass:
-    Use OpenCV Gaussian blur (vectorized, C++).
-    We map smaller keep_fraction -> stronger blur (larger sigma).
+    FAST replacement for FFT low-pass: OpenCV Gaussian blur (vectorized, C++).
+    Smaller keep_fraction -> stronger blur (larger sigma).
     """
-    # clamp and map keep_fraction in [0.01, 0.99] to sigma in ~[0.6, 4.0]
     kf = float(np.clip(keep_fraction, 0.01, 0.99))
-    sigma = 0.6 + (1.0 - kf) * 3.4  # keep_fraction=0.1 -> ~3.66 (strong smooth)
-    # (0,0) lets OpenCV compute kernel size from sigma; preserves uint8 dtype
+    sigma = 0.6 + (1.0 - kf) * 3.4  # keep_fraction=0.1 -> ~3.66
     return cv2.GaussianBlur(image, (0, 0), sigmaX=sigma, sigmaY=sigma, borderType=cv2.BORDER_REPLICATE)
 
 
@@ -82,29 +78,25 @@ def local_variance_cv(image: np.ndarray, ksize: int = 3) -> np.ndarray:
 
 def robust_laplacian_edge_detector(image_gray: np.ndarray, log_image: np.ndarray, threshold_value: float) -> np.ndarray:
     """
-    FAST vectorized zero-crossing + variance gating (no Python loops).
-    Keeps your API and behavior, but runs orders of magnitude faster.
+    Vectorized zero-crossing + variance gating (no Python loops).
     """
-    # local variance (already fast via OpenCV box filters)
     variance_image = local_variance_cv(image_gray, 3)
 
-    # compute zero-crossings along vertical and horizontal directions
-    # shapes: center window is [1:-1,1:-1]
+    # zero-crossings (center region)
     zc_vert = (log_image[2:, 1:-1] * log_image[:-2, 1:-1]) < 0
     zc_horz = (log_image[1:-1, 2:] * log_image[1:-1, :-2]) < 0
     zc = np.logical_or(zc_vert, zc_horz)
 
-    # variance gate at center pixels
+    # variance gate
     var_gate = variance_image[1:-1, 1:-1] > threshold_value
 
-    # compose edges
     edges = np.zeros_like(image_gray, dtype=np.uint8)
     edges[1:-1, 1:-1] = (zc & var_gate).astype(np.uint8) * 255
     return edges
 
 
 # -----------------------------
-# A* Pathfinding
+# A* Pathfinding (unchanged)
 # -----------------------------
 def get_neighbors(pos, rows, cols):
     r, c = pos
@@ -165,10 +157,13 @@ def slope_to_clock_if(m_img: float) -> str:
 
 
 # -----------------------------
-# MiDaS (TFLite)
+# MiDaS (TFLite) — load once
 # -----------------------------
 class MidasTFLite:
     def __init__(self, model_path: str):
+        model_path = Path(model_path)
+        if not model_path.exists():
+            raise FileNotFoundError(f"TFLite model not found: {model_path}")
         self.interpreter = Interpreter(model_path=str(model_path))
         self.interpreter.allocate_tensors()
         self.input_details = self.interpreter.get_input_details()
@@ -185,11 +180,20 @@ class MidasTFLite:
         return (resized.astype(np.float32) / 255.0)[np.newaxis, ...]
 
     def postprocess(self, out_arr: np.ndarray, out_size_hw) -> np.ndarray:
-        x = out_arr[0]
+        x = out_arr
+        if x.ndim == 4:
+            if x.shape[-1] == 1:
+                x = x[0, :, :, 0]
+            elif x.shape[1] == 1:
+                x = x[0, 0, :, :]
+            else:
+                x = x[0]
+        elif x.ndim == 3:
+            x = x[0]
         x = x.astype(np.float32)
         mn, mx = float(x.min()), float(x.max())
         if mx - mn < 1e-9:
-            x[:] = 0
+            x = np.zeros_like(x, dtype=np.uint8)
         else:
             x = (255.0 * (x - mn) / (mx - mn)).astype(np.uint8)
         H, W = out_size_hw
@@ -204,16 +208,12 @@ class MidasTFLite:
 
 
 # -----------------------------
-# One-image pipeline
+# Pipeline (array input)
 # -----------------------------
-def process_image(image_path: Path, depth_net: MidasTFLite, clahe_clip: float, clahe_tiles: tuple[int, int]):
+def process_image_array(img_rgb: np.ndarray, depth_net: MidasTFLite, clahe_clip: float, clahe_tiles: tuple[int, int]):
     timings = {}
-    with measure(timings, "read_image"):
-        img_bgr = cv2.imread(str(image_path))
-        if img_bgr is None:
-            print(f"Failed to read {image_path}")
-            return
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+    with measure(timings, "prep_gray"):
         img_gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
 
     with measure(timings, "clahe"):
@@ -268,49 +268,107 @@ def process_image(image_path: Path, depth_net: MidasTFLite, clahe_clip: float, c
         direction = slope_to_clock_if(m_img)
 
     total = sum(timings.values())
-    print(f"\n🖼️ Image: {image_path.name}")
-    for k, v in timings.items():
+    return {
+        "direction": direction,
+        "slope_m_img": float(m_img),
+        "timings_s": timings,
+        "total_s": total,
+    }
+
+
+def print_pipeline_report(image_label: str, result: dict):
+    print(f"\n🖼️ Image: {image_label}")
+    for k, v in result["timings_s"].items():
         print(f"  {k:<22} {ms(v):8.2f} ms")
     print(f"  {'-'*35}")
-    print(f"  TOTAL{'':17} {ms(total):8.2f} ms | Direction: {direction}")
-    return total
+    print(f"  TOTAL{'':17} {ms(result['total_s']):8.2f} ms | Direction: {result['direction']} | Slope: {result['slope_m_img']:.4f}")
 
 
 # -----------------------------
-# Batch driver
+# Flask App
 # -----------------------------
-def main():
-    ap = argparse.ArgumentParser(description="Process multiple images, print timings, and reuse TFLite model once.")
-    ap.add_argument("--images", type=str, default="assets/*.jpg")
-    ap.add_argument("--model", type=str, default="models/Midas-V2.tflite")
-    ap.add_argument("--clahe-clip", type=float, default=2.0)
-    ap.add_argument("--clahe-tiles", type=int, nargs=2, default=(8, 8))
-    args = ap.parse_args()
+app = Flask(__name__)
+MODEL_PATH = os.environ.get("MIDAS_TFLITE", "models/Midas-V2.tflite")
+print("Loading model once...", end=" ", flush=True)
+_t0 = time.perf_counter()
+depth_net = MidasTFLite(MODEL_PATH)  # load once at startup
+print(f"done ({ms(time.perf_counter()-_t0):.1f} ms).")
 
-    files = sorted(glob(args.images))
-    if not files:
-        print("No images found.")
-        return
 
-    print(f"Loading model once... ", end="", flush=True)
-    t0 = time.perf_counter()
-    depth_net = MidasTFLite(args.model)
-    print(f"done ({ms(time.perf_counter() - t0):.1f} ms).")
+@app.get("/")
+def index():
+    return render_template("index.html", defaults={"clahe_clip": 2.0, "tile_w": 8, "tile_h": 8})
 
-    totals = []
-    for img_path in files:
-        try:
-            total = process_image(Path(img_path), depth_net, args.clahe_clip, tuple(args.clahe_tiles))
-            totals.append(total)
-        except Exception as e:
-            print(f"⚠️ Skipped {img_path}: {e}")
 
-    if totals:
-        avg = ms(np.mean(totals))
-        print(f"\n✅ Processed {len(totals)} image(s). Avg total per image: {avg:.2f} ms.")
-    else:
-        print("No images processed.")
+def _read_image_from_request(file_storage):
+    # Read bytes → np array (BGR) → RGB
+    file_bytes = np.frombuffer(file_storage.read(), np.uint8)
+    bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    if bgr is None:
+        return None
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+
+@app.post("/process")
+def process_form():
+    if "image" not in request.files:
+        abort(400, "No file part named 'image'")
+    f = request.files["image"]
+    if f.filename == "":
+        abort(400, "No file selected")
+
+    # parameters
+    try:
+        clahe_clip = float(request.form.get("clahe_clip", 2.0))
+        tile_w = int(request.form.get("tile_w", 8))
+        tile_h = int(request.form.get("tile_h", 8))
+    except Exception:
+        abort(400, "Invalid CLAHE parameters")
+
+    # image -> pipeline
+    img_rgb = _read_image_from_request(f)
+    if img_rgb is None:
+        abort(400, "Could not decode image")
+
+    result = process_image_array(img_rgb, depth_net, clahe_clip, (tile_w, tile_h))
+
+    # PRINT to terminal
+    print_pipeline_report(image_label=f.filename or "upload", result=result)
+
+    # go back to the same index page
+    return redirect(url_for("index"))
+
+
+# Optional: JSON API, also prints to terminal
+@app.post("/api/process")
+def process_api():
+    if "image" not in request.files:
+        return jsonify({"error": "No file part named 'image'"}), 400
+    f = request.files["image"]
+
+    try:
+        clahe_clip = float(request.form.get("clahe_clip", 2.0))
+        tile_w = int(request.form.get("tile_w", 8))
+        tile_h = int(request.form.get("tile_h", 8))
+    except Exception:
+        return jsonify({"error": "Invalid CLAHE parameters"}), 400
+
+    img_rgb = _read_image_from_request(f)
+    if img_rgb is None:
+        return jsonify({"error": "Could not decode image"}), 400
+
+    result = process_image_array(img_rgb, depth_net, clahe_clip, (tile_w, tile_h))
+    print_pipeline_report(image_label=f.filename or "upload(api)", result=result)
+    return jsonify(
+        {
+            "direction": result["direction"],
+            "slope_m_img": result["slope_m_img"],
+            "total_ms": ms(result["total_s"]),
+            "steps_ms": {k: ms(v) for k, v in result["timings_s"].items()},
+        }
+    )
 
 
 if __name__ == "__main__":
-    main()
+    # Run local dev server: python app.py
+    app.run(host="0.0.0.0", port=5000, debug=True)
