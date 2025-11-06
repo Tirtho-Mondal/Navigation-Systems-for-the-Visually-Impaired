@@ -1,0 +1,23 @@
+{
+  "image": "5.jpg",
+  "direction": "12:30",
+  "slope_m_img": -2.712643662571014,
+  "steps_ms": {
+    "read_image": 20.540799996524584,
+    "clahe": 16.868299993802793,
+    "fft_denoise_1": 250.81150000187336,
+    "log_kernel": 0.07390000246232376,
+    "log_convolution": 14.738699996087234,
+    "edge_detection": 7086.761499995191,
+    "fft_denoise_2": 250.14070000179345,
+    "depth_inference_tflite": 159.89629999967292,
+    "combine_depth_edge": 6.246699995244853,
+    "patchify": 4.48340000002645,
+    "astar_pathfinding": 0.12959999730810523,
+    "slope_direction": 0.055800002883188426,
+    "draw_arrow": 1.0586999997030944,
+    "save_arrow_png": 64.99990000156686,
+    "plot_and_save_grid": 2456.7227000006824
+  },
+  "total_ms": 10333.528499984823
+}

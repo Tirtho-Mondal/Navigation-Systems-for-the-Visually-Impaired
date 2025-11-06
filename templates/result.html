@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Results — MiDaS Depth + Direction</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <style>
+    :root{
+      --bg: #fafafa;
+      --fg: #0b1220;
+      --muted:#6b7280;
+      --card:#ffffff;
+      --border:#e5e7eb;
+      --brand:#111827;
+      --brand-contrast:#ffffff;
+      --badge-bg:#eef2ff;
+      --badge-fg:#3730a3;
+      --shadow: 0 6px 20px rgba(0,0,0,.08);
+      --radius: 14px;
+      --radius-sm: 10px;
+      --gap: 1rem;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root{
+        --bg:#0b1220;
+        --fg:#e5e7eb;
+        --muted:#9aa3b2;
+        --card:#0f172a;
+        --border:#1f2937;
+        --brand:#e5e7eb;
+        --brand-contrast:#0b1220;
+        --badge-bg:#1f2937;
+        --badge-fg:#c7d2fe;
+        --shadow: 0 8px 26px rgba(0,0,0,.35);
+      }
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      margin:0;
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif;
+      color:var(--fg);
+      background:var(--bg);
+    }
+
+    /* Top bar */
+    .topbar{
+      position:sticky; top:0; z-index:10;
+      backdrop-filter: blur(8px);
+      background: color-mix(in oklab, var(--bg) 85%, transparent);
+      border-bottom:1px solid var(--border);
+    }
+    .topbar-wrap{
+      max-width: 1200px; margin:0 auto; padding: .9rem 1rem;
+      display:flex; align-items:center; justify-content:space-between; gap:.75rem;
+    }
+    .brand{
+      display:flex; align-items:center; gap:.6rem; font-weight:700; letter-spacing:.2px;
+    }
+    .brand .dot{
+      width:10px; height:10px; border-radius:999px; background:var(--badge-fg);
+      box-shadow: 0 0 0 6px color-mix(in oklab, var(--badge-bg) 70%, transparent);
+    }
+    .btn{
+      display:inline-flex; align-items:center; gap:.5rem;
+      background:var(--brand); color:var(--brand-contrast);
+      border:none; text-decoration:none; font-weight:600;
+      padding:.62rem .9rem; border-radius:12px; cursor:pointer;
+      box-shadow: var(--shadow);
+    }
+    .btn:hover{ opacity:.92 }
+    .btn:active{ transform: translateY(1px) }
+
+    main{ max-width:1200px; margin: 1.2rem auto 2rem; padding: 0 1rem; }
+
+    /* Summary cards */
+    .summary{
+      display:grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: var(--gap);
+    }
+    .card{
+      background: var(--card);
+      border:1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1rem;
+      box-shadow: var(--shadow);
+    }
+    .card h2{ margin:0 0 .5rem 0; font-size:1rem; font-weight:700 }
+    .kpi{
+      display:flex; align-items:baseline; gap:.6rem; flex-wrap:wrap;
+    }
+    .kpi .value{
+      font-size:1.7rem; font-weight:800; letter-spacing:.2px;
+    }
+    .badge{
+      display:inline-flex; align-items:center; gap:.35rem;
+      background:var(--badge-bg); color:var(--badge-fg);
+      border-radius:999px; padding:.28rem .65rem; font-weight:700; font-size:.95rem;
+    }
+    .muted{ color: var(--muted) }
+
+    /* Table */
+    .table-wrap{ overflow:auto; }
+    table{ width:100%; border-collapse: collapse; margin-top:.25rem; }
+    thead th{
+      position:sticky; top:0; background:var(--card);
+      border-bottom:1px solid var(--border); font-size:.9rem; text-transform:uppercase; letter-spacing:.04em;
+    }
+    th, td{ padding:.7rem .6rem; border-bottom:1px solid var(--border); }
+    tbody tr:hover{ background: color-mix(in oklab, var(--card) 80%, transparent); }
+
+    /* Gallery */
+    .gallery{
+      display:grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: var(--gap);
+    }
+    .thumb{
+      display:block; background:var(--card); border:1px solid var(--border);
+      border-radius: var(--radius); padding:.6rem; text-decoration:none; color:inherit;
+      transition: transform .06s ease;
+    }
+    .thumb:hover{ transform: translateY(-1px); }
+    .thumb h3{ margin:.2rem 0 .6rem; font-size:.95rem }
+    .thumb img{ width:100%; height:auto; display:block; border-radius:12px; background:#0b12200d; }
+
+    /* Lightbox (dialog) */
+    dialog{
+      width:min(96vw, 1100px);
+      border:none; padding:0; border-radius:16px; overflow:hidden;
+      background:var(--card); color:var(--fg); box-shadow: var(--shadow);
+    }
+    dialog::backdrop{ background:rgba(0,0,0,.45) }
+    .dlg-head{
+      display:flex; align-items:center; justify-content:space-between; gap:.5rem;
+      padding:.8rem 1rem; border-bottom:1px solid var(--border);
+    }
+    .dlg-body{ padding:1rem; }
+    .dlg-body img{ width:100%; height:auto; display:block; border-radius:12px; background:#0b12200d; }
+    .icon{ width:18px; height:18px; }
+    .ghost{
+      background:transparent; border:1px solid var(--border);
+      color:var(--fg); border-radius:10px; padding:.45rem .7rem; cursor:pointer;
+    }
+    .ghost:hover{ background: color-mix(in oklab, var(--card) 85%, transparent); }
+
+    /* Sections */
+    section{ margin-top: 1.4rem; }
+    section h2{ margin:0 0 .6rem; font-size:1.05rem; }
+  </style>
+</head>
+<body>
+  <!-- Top navigation -->
+  <header class="topbar">
+    <div class="topbar-wrap">
+      <div class="brand">
+        <span class="dot" aria-hidden="true"></span>
+        <span>Direction</span>
+      </div>
+      <a class="btn" href="/" aria-label="Run another image">
+        <!-- upload arrow icon -->
+        <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <path d="M12 16a1 1 0 0 1-1-1V8.41l-2.3 2.3a1 1 0 1 1-1.4-1.42l4-4a1 1 0 0 1 1.4 0l4 4a1 1 0 0 1-1.4 1.42L13 8.4V15a1 1 0 0 1-1 1z"/>
+          <path d="M5 20a1 1 0 1 1 0-2h14a1 1 0 1 1 0 2H5z"/>
+        </svg>
+        <span>Run another</span>
+      </a>
+    </div>
+  </header>
+
+  <main>
+    <!-- Summary -->
+    <section class="summary">
+      <article class="card">
+        <h2>Direction</h2>
+        <div class="kpi">
+          <span class="badge" aria-label="Clock direction">{{ direction }}</span>
+          <span class="muted">clock dial</span>
+        </div>
+      </article>
+
+      <article class="card">
+        <h2>Slope (image space)</h2>
+        <div class="kpi">
+          <span class="value">{{ slope }}</span>
+          <span class="muted">m</span>
+        </div>
+      </article>
+
+      <article class="card">
+        <h2>Total Time</h2>
+        <div class="kpi">
+          <span class="value">{{ total_ms }}</span>
+          <span class="muted">s</span>
+        </div>
+      </article>
+    </section>
+
+    <!-- Timings -->
+    <section>
+      <h2>Per-step timings</h2>
+      <div class="table-wrap card">
+        <table role="table" aria-label="Per-step timings in seconds">
+          <thead>
+            <tr><th scope="col">Step</th><th scope="col">Time (s)</th></tr>
+          </thead>
+          <tbody>
+            {% for name, t in timings %}
+              <tr>
+                <td>{{ name }}</td>
+                <td>{{ t }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Images -->
+    <section>
+      <h2>Intermediate images</h2>
+      <div class="gallery">
+        {% for im in images %}
+          <a class="thumb" href="#" data-title="{{ im.title }}" data-src="{{ im.data_url }}" aria-label="Open {{ im.title }}">
+            <h3>{{ im.title }}</h3>
+            <img src="{{ im.data_url }}" alt="{{ im.title }}">
+          </a>
+        {% endfor %}
+      </div>
+    </section>
+  </main>
+
+  <!-- Lightbox dialog -->
+  <dialog id="lightbox" aria-label="Preview">
+    <div class="dlg-head">
+      <strong id="dlg-title">Preview</strong>
+      <button class="ghost" id="dlg-close" aria-label="Close preview">Close</button>
+    </div>
+    <div class="dlg-body">
+      <img id="dlg-img" src="" alt="">
+    </div>
+  </dialog>
+
+  <script>
+    // Simple accessible lightbox using <dialog>
+    const dlg = document.getElementById('lightbox');
+    const imgEl = document.getElementById('dlg-img');
+    const titleEl = document.getElementById('dlg-title');
+    const closeBtn = document.getElementById('dlg-close');
+
+    document.addEventListener('click', (e) => {
+      const a = e.target.closest('a.thumb');
+      if (!a) return;
+      e.preventDefault();
+      const src = a.getAttribute('data-src');
+      const title = a.getAttribute('data-title') || 'Preview';
+      imgEl.src = src;
+      imgEl.alt = title;
+      titleEl.textContent = title;
+      if (typeof dlg.showModal === 'function') {
+        dlg.showModal();
+      } else {
+        // Fallback: open image in new tab
+        window.open(src, '_blank');
+      }
+    });
+
+    closeBtn.addEventListener('click', () => dlg.close());
+    dlg.addEventListener('click', (e) => {
+      // Click outside content closes dialog
+      const rect = dlg.getBoundingClientRect();
+      const inDialog = e.clientX >= rect.left && e.clientX <= rect.right &&
+                       e.clientY >= rect.top && e.clientY <= rect.bottom;
+      if (!inDialog) dlg.close();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && dlg.open) dlg.close();
+    });
+  </script>
+</body>
+</html>

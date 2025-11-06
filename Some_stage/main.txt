@@ -1,0 +1,352 @@
+import torch
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import math
+import heapq
+
+
+
+def fft_denoise(image, keep_fraction=0.1):
+
+    #Step 1: Normalize the image to [0, 1] for numerical stability ---
+    image_float = image.astype(np.float32) / 255.0
+
+    # Step 2: Compute the 2D Fast Fourier Transform ---
+    # Converts the image from spatial domain to frequency domain.
+    f = np.fft.fft2(image_float)
+
+    # Step 3: Shift the zero-frequency component (DC) to the center ---
+    # This makes the low frequencies appear in the center of the spectrum.
+    fshift = np.fft.fftshift(f)
+
+    # Step 4: Create a low-pass filter mask ---
+    # The mask keeps only the center region of the frequency spectrum.
+    rows, cols = image.shape
+    crow, ccol = rows // 2, cols // 2  # center point
+    mask = np.zeros((rows, cols), np.float32)
+    keep_r = int(rows * keep_fraction / 2)
+    keep_c = int(cols * keep_fraction / 2)
+    mask[crow - keep_r:crow + keep_r, ccol - keep_c:ccol + keep_c] = 1.0
+
+    # Step 5: Apply the mask to filter out high frequencies ---
+    fshift_filtered = fshift * mask
+
+    # Step 6: Inverse FFT shift and transform back to spatial domain ---
+    # Moves the zero-frequency component back and converts to an image again.
+    f_ishift = np.fft.ifftshift(fshift_filtered)
+    img_back = np.fft.ifft2(f_ishift)
+
+    # Step 7: Take the magnitude (real part) of the complex result ---
+    img_denoised = np.abs(img_back)
+
+    # Step 8: Scale back to [0, 255] and convert to uint8 image ---
+    img_denoised = np.clip(img_denoised * 255.0, 0, 255).astype(np.uint8)
+
+    return img_denoised
+
+
+
+def gaussian_kernel(size, sigma):
+    k = size // 2
+    kernel = np.zeros((size, size), dtype=np.float32)
+    for i in range(size):
+        for j in range(size):
+            x, y = i - k, j - k
+            kernel[i, j] = (1 / (2 * np.pi * sigma**2)) * np.exp(-(x**2 + y**2) / (2 * sigma**2))
+    kernel /= np.sum(kernel)
+    return kernel
+
+def manual_gaussian_blur(image, kernel_size=5, sigma=1.5):
+    kernel = gaussian_kernel(kernel_size, sigma)
+    return cv2.filter2D(image, -1, kernel)
+
+
+# ------------------------------------
+# Load MiDaS Depth Model
+# ------------------------------------
+midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small", trust_repo=True)
+midas.eval()
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+midas.to(device)
+
+midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+transform = midas_transforms.small_transform if hasattr(midas_transforms, "small_transform") else midas_transforms.default_transform
+
+
+import cv2
+import numpy as np
+
+def apply_hist_eq_rgb(image_rgb):
+    # Step 1: Convert to HSV
+    hsv = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2HSV)
+    h, s, v = cv2.split(hsv)
+
+    # Step 2: Calculate histogram of V channel
+    hist = cv2.calcHist([v], [0], None, [256], [0, 256])
+
+    # Step 3: Normalize histogram and calculate cumulative distribution function (CDF)
+    cdf = hist.cumsum()
+    cdf_normalized = cdf / cdf[-1]  # Normalize to [0,1]
+
+    # Step 4: Create lookup table (LUT)
+    lut = np.uint8(255 * cdf_normalized)
+
+    # Step 5: Apply LUT to V channel
+    v_eq = cv2.LUT(v, lut)
+
+    # Step 6: Merge channels back and convert to RGB
+    hsv_eq = cv2.merge([h, s, v_eq])
+    image_eq = cv2.cvtColor(hsv_eq, cv2.COLOR_HSV2RGB)
+
+    return image_eq
+
+
+
+def apply_hist_eq_rgb(image_rgb):
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    r, g, b = cv2.split(image_rgb)
+    return cv2.merge([clahe.apply(r), clahe.apply(g), clahe.apply(b)])
+
+
+
+# ------------------------------------
+# Laplacian of Gaussian (LoG)
+# ------------------------------------
+def LoG(x, y, sigma):
+    r2 = x**2 + y**2
+    return -1 / (math.pi * sigma**4) * (1 - r2 / (2 * sigma**2)) * np.exp(-r2 / (2 * sigma**2))
+
+def LoG_Kernel_Generator(size, sigma):
+    kernel = np.zeros((size, size))
+    k = size // 2
+    for i in range(-k, k + 1):
+        for j in range(-k, k + 1):
+            kernel[k - j, k + i] = LoG(i, j, sigma)
+    return kernel
+
+def local_variance_cv(image, ksize=3):
+    image = image.astype(np.float32)
+    mean = cv2.blur(image, (ksize, ksize))
+    mean_sq = cv2.blur(image**2, (ksize, ksize))
+    variance = mean_sq - mean**2
+    pad = ksize // 2
+    variance[:pad, :] = variance[-pad:, :] = variance[:, :pad] = variance[:, -pad:] = 0
+    return variance
+
+def robust_laplacian_edge_detector(image, log_image, threshold_value):
+    M, N = image.shape
+    edges = np.zeros_like(image, dtype=np.float32)
+    variance_image = local_variance_cv(image, 3)
+    for i in range(1, M-1):
+        for j in range(1, N-1):
+            if (log_image[i+1, j] * log_image[i-1, j] < 0) or (log_image[i, j+1] * log_image[i, j-1] < 0):
+                edges[i, j] = 255 if variance_image[i, j] > threshold_value else 0
+    return edges
+
+
+
+# ------------------------------------
+# A* Pathfinding
+# ------------------------------------
+def get_neighbors(pos, rows, cols):
+    """Return a list of valid 8-connected neighbors for (r, c)."""
+    r, c = pos
+    neighbors = []
+    for dr, dc in [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]:
+        nr, nc = r + dr, c + dc
+        if 0 <= nr < rows and 0 <= nc < cols:
+            neighbors.append((nr, nc))
+    return neighbors
+
+
+def heuristic(a, b):
+  return math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2)
+
+
+def astar_pathfinding(cost_map, start, goal):
+    rows, cols = cost_map.shape
+    open_set = [(0, start)]
+    came_from, g_score, f_score = {}, {start: 0.0}, {start: heuristic(start, goal)}
+
+    while open_set:
+        _, current = heapq.heappop(open_set)
+        if current == goal:
+            path = [current]
+            while current in came_from:
+                current = came_from[current]
+                path.append(current)
+            return path[::-1]
+        for neighbor in get_neighbors(current, rows, cols):
+            tentative_g = g_score[current] + cost_map[neighbor]
+            if tentative_g < g_score.get(neighbor, np.inf):
+                came_from[neighbor] = current
+                g_score[neighbor] = tentative_g
+                f_score[neighbor] = tentative_g + heuristic(neighbor, goal)
+                heapq.heappush(open_set, (f_score[neighbor], neighbor))
+    return []
+
+
+
+def slope_to_clock_if(m_img):
+    import numpy as np
+
+    m_math = -m_img
+    vx, vy = (1.0, m_math) if m_math >= 0 else (-1.0, -m_math)
+    angle = np.degrees(np.arctan2(vy, vx))
+    angle = np.clip(angle, 0, 180)
+
+    # Using if-elif logic to assign a label based on angle range
+    if angle < 7.5:
+        return "3"
+    elif angle < 22.5:
+        return "2:30"
+    elif angle < 37.5:
+        return "2"
+    elif angle < 52.5:
+        return "1:30"
+    elif angle < 67.5:
+        return "1"
+    elif angle < 82.5:
+        return "12:30"
+    elif angle < 97.5:
+        return "12"
+    elif angle < 112.5:
+        return "11:30"
+    elif angle < 127.5:
+        return "11"
+    elif angle < 142.5:
+        return "10:30"
+    elif angle < 157.5:
+        return "10"
+    elif angle < 172.5:
+        return "9:30"
+    else:
+        return "9"
+
+
+
+# ------------------------------------
+# Full Pipeline
+# ------------------------------------
+fig, axes = plt.subplots(13, 8, figsize=(42, 60))
+plt.subplots_adjust(hspace=0.4, wspace=0.3)
+
+for img_idx in range(1, 14):
+    img_path = f"{img_idx}.jpg"
+    img = cv2.imread(img_path)
+    if img is None:
+        print(f"{img_path} not found. Skipping...")
+        continue
+
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img_gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+
+    # Step 1: Histogram Equalization
+    img_eq = apply_hist_eq_rgb(img_rgb)
+
+    # Step 2: FFT Denoise #1
+    smooth1_gray = fft_denoise(cv2.cvtColor(img_eq, cv2.COLOR_RGB2GRAY), keep_fraction=0.1)
+    smooth1 = cv2.cvtColor(smooth1_gray, cv2.COLOR_GRAY2RGB)
+
+    # Step 3: Edge Detection (LoG)
+    sigma = 1
+    kernel_size = int(9 * sigma) | 1  # ensure odd
+    log_kernel = LoG_Kernel_Generator(kernel_size, sigma)
+    log_conv = cv2.filter2D(smooth1_gray.astype(np.float32), -1, log_kernel)
+    edges = robust_laplacian_edge_detector(img_gray, log_conv, 150)
+
+    # Step 4: FFT Denoise #2
+    smooth2_gray = fft_denoise(cv2.cvtColor(img_eq, cv2.COLOR_RGB2GRAY), keep_fraction=0.1)
+    smooth2 = cv2.cvtColor(smooth2_gray, cv2.COLOR_GRAY2BGR)
+
+    # Step 5: Depth Map (MiDaS)
+    input_batch = transform(smooth2).to(device)
+    with torch.no_grad():
+        pred = midas(input_batch)
+        pred = torch.nn.functional.interpolate(
+            pred.unsqueeze(1), size=img_rgb.shape[:2],
+            mode="bicubic", align_corners=False
+        ).squeeze()
+    depth = cv2.normalize(pred.cpu().numpy(), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    # Step 6: Combine Depth + Edge
+    height, width = depth.shape
+    combined = np.zeros((height, width), dtype=np.float32)
+    edges_binary = (edges > 0).astype(np.uint8)
+
+    for y in range(height):
+        for x in range(width):
+            if edges_binary[y, x] == 1:
+                combined[y, x] = 255.0  # brighter highlight for visibility
+            else:
+                combined[y, x] = depth[y, x]
+
+    combined = cv2.normalize(combined, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    # Step 7: Patch & A* Pathfinding
+    # Step 7: Create 15x15 patch version (simple average)
+    PATCH_ROWS, PATCH_COLS = 15, 15
+    height, width = combined.shape
+
+    patch_h = height // PATCH_ROWS
+    patch_w = width // PATCH_COLS
+
+    combo_patch = np.zeros((PATCH_ROWS, PATCH_COLS), dtype=np.float32)
+
+    # Loop over each patch
+    for r in range(PATCH_ROWS):
+        for c in range(PATCH_COLS):
+            y1 = r * patch_h
+            y2 = (r + 1) * patch_h
+            x1 = c * patch_w
+            x2 = (c + 1) * patch_w
+
+            # take average value of all pixels in that patch
+            patch = combined[y1:y2, x1:x2]
+            combo_patch[r, c] = np.mean(patch)
+
+    # normalize to [0,1]
+    combo_patch_f = combo_patch / 255.0
+
+
+    start = (PATCH_ROWS - 1, PATCH_COLS // 2)
+    goal_region = combo_patch[:5, :]
+    goal = np.unravel_index(np.argmin(goal_region), goal_region.shape)
+
+    path = astar_pathfinding(combo_patch_f, start, goal)
+    if not path:
+        print(f"No path found for {img_path}")
+        continue
+
+    # Step 8: Compute slope & direction
+    x_vals = np.array([c - start[1] for r, c in path])
+    y_vals = np.array([r - start[0] for r, c in path])
+    m = np.sum(x_vals * y_vals) / (np.sum(x_vals**2) + 1e-6)
+    h, w = img_rgb.shape[:2]
+    m_img = (h / PATCH_ROWS) / (w / PATCH_COLS) * m
+    c_img = (h - 1) - m_img * (w // 2)
+    direction = slope_to_clock_if(m_img)
+
+    # Step 9: Draw Arrow
+    img_arrow = img_rgb.copy()
+    arrow_len = int(h / 3)
+    y_end = max(h - 1 - arrow_len, 0)
+    x_end = int((y_end - c_img) / m_img)
+    cv2.arrowedLine(img_arrow, (w // 2, h - 1), (x_end, y_end), (255, 255, 0), 3, tipLength=0.2)
+
+    # Step 10: Plot Results
+    row = img_idx - 1
+    titles = ["Original", "Histogram Eq", "FFT Denoise #1", "Edges (LoG)",
+              "Depth Map", "Depth + Edge", "15x15 Patch + Path", f"Clock: {direction} (m={m_img:.3f})"]
+    images = [img_rgb, img_eq, smooth1, edges, depth, combined, combo_patch, img_arrow]
+
+    for j, (im, title) in enumerate(zip(images, titles)):
+        axes[row, j].imshow(im, cmap='gray' if j >= 3 else None)
+        axes[row, j].set_title(title)
+        axes[row, j].axis('off')
+
+plt.suptitle("Full Pipeline: Histogram → FFT Denoise → Edge → FFT Denoise → Depth → Combine → Patch → A* → Clock", fontsize=20)
+plt.tight_layout(rect=[0, 0, 1, 0.97])
+plt.show()

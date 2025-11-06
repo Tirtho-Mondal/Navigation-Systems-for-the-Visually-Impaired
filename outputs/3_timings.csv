@@ -1,0 +1,17 @@
+step,time_ms,percent
+read_image,20.785,0.373
+clahe,6.300,0.113
+fft_denoise_1,155.119,2.785
+log_kernel,0.102,0.002
+log_convolution,9.075,0.163
+edge_detection,3557.359,63.878
+fft_denoise_2,170.460,3.061
+depth_inference_tflite,153.564,2.757
+combine_depth_edge,2.137,0.038
+patchify,2.093,0.038
+astar_pathfinding,0.121,0.002
+slope_direction,0.071,0.001
+draw_arrow,0.645,0.012
+save_arrow_png,32.672,0.587
+plot_and_save_grid,1458.458,26.189
+TOTAL,5568.961,100.000

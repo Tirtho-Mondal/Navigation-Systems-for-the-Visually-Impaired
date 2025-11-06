@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Image Upload Portal</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    /* Base reset and layout */
+    html, body {
+      height: 100%;
+      margin: 0;
+      font-family: "Segoe UI", Roboto, Arial, sans-serif;
+      background-color: #f4f6f9;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+
+    /* Container styling */
+    .container {
+      background-color: #ffffff;
+      padding: 2rem 2.5rem;
+      border-radius: 12px;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.06);
+      max-width: 400px;
+      width: 100%;
+      text-align: center;
+    }
+
+    /* Heading */
+    h1 {
+      font-size: 1.5rem;
+      margin-bottom: 1rem;
+      color: #111827;
+      letter-spacing: 0.5px;
+    }
+
+    p {
+      font-size: 0.95rem;
+      color: #6b7280;
+      margin-bottom: 1.5rem;
+    }
+
+    /* File input */
+    input[type="file"] {
+      display: block;
+      width: 100%;
+      padding: 0.6rem;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      background-color: #f9fafb;
+      font-size: 0.9rem;
+      cursor: pointer;
+      margin-bottom: 1rem;
+    }
+
+    /* Button styling */
+    button {
+      width: 100%;
+      background-color: #1e3a8a;
+      color: #ffffff;
+      border: none;
+      border-radius: 8px;
+      padding: 0.7rem;
+      font-size: 1rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background-color 0.3s ease;
+    }
+
+    button:hover {
+      background-color: #1d4ed8;
+    }
+
+    /* Footer note */
+    .note {
+      margin-top: 1rem;
+      font-size: 0.85rem;
+      color: #9ca3af;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Upload Your Image</h1>
+    <p>Please select an image file to upload for processing.</p>
+
+    <form method="post" action="/process" enctype="multipart/form-data">
+      <input name="image" type="file" accept="image/*" required>
+      <button type="submit">Submit</button>
+    </form>
+
+    <div class="note">Accepted formats: JPG, PNG, GIF (Max 10MB)</div>
+  </div>
+</body>
+</html>
